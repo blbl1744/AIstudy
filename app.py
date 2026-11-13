@@ -10,6 +10,8 @@ AI学伴 · 1对1专注度智能监护系统
 import asyncio
 import base64
 import json
+import logging
+import logging.handlers
 import random
 import time
 import math
@@ -18,7 +20,8 @@ import sys
 import hmac
 import joblib
 import threading
-from collections import Counter
+from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import hashlib
 import secrets
@@ -27,9 +30,9 @@ import bcrypt
 import jwt
 import requests
 from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
-from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager, contextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -37,6 +40,40 @@ import uvicorn
 import cv2                         
 import mediapipe as mp          
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ========== P2-5：结构化日志初始化（控制台 + 滚动文件） ==========
+# 约定：模块 logger 固定命名为 "aistudy"；日志目录固定为项目根目录下的 logs/，
+# 单文件上限 10MB、保留 5 份历史；全文件不再使用 print，统一走 logger 分级输出。
+# 对外 HTTP/WS 响应中严禁携带任何内部异常细节（str(e) / 堆栈），只返回通用安全提示。
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+logger = logging.getLogger("aistudy")
+# 仅在尚未挂载处理器时初始化，避免 uvicorn --reload 或多进程重复 import 导致日志重复写入
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _LOG_FORMAT = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(module)s:%(lineno)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _console_handler = logging.StreamHandler(sys.stdout)
+    _console_handler.setFormatter(_LOG_FORMAT)
+    logger.addHandler(_console_handler)
+    try:
+        # 启动时自动建立日志目录
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=10 * 1024 * 1024,   # 单文件 10MB
+            backupCount=5,               # 保留 5 份滚动历史
+            encoding="utf-8",
+        )
+        _file_handler.setFormatter(_LOG_FORMAT)
+        logger.addHandler(_file_handler)
+    except OSError as _log_init_err:
+        # 日志目录不可写时降级为仅控制台输出，绝不因日志问题阻塞服务启动
+        logger.warning("日志文件处理器初始化失败，已降级为仅控制台输出：%s", _log_init_err)
+    logger.propagate = False
 
 
 # ========== 先加载配置 ==========
@@ -168,7 +205,7 @@ if _ENV_JWT_SECRET:
     JWT_SECRET_KEY = _ENV_JWT_SECRET
 if str(JWT_SECRET_KEY or "").strip() in _INSECURE_JWT_SECRETS:
     JWT_SECRET_KEY = secrets.token_urlsafe(48)
-    print("[安全警告] 未配置环境变量 AI_STUDY_JWT_SECRET，已生成进程内临时 JWT 密钥：服务重启后所有登录令牌将失效，生产环境请务必配置该环境变量。")
+    logger.warning("[安全警告] 未配置环境变量 AI_STUDY_JWT_SECRET，已生成进程内临时 JWT 密钥：服务重启后所有登录令牌将失效，生产环境请务必配置该环境变量。")
 
 # P0-6 CORS：禁止 allow_origins=["*"] 与 allow_credentials=True 同时出现（浏览器规范不允许该组合）。
 #   环境变量名：AI_STUDY_CORS_ORIGINS，多个来源用英文逗号分隔
@@ -183,18 +220,157 @@ else:
 # 通配来源与凭证模式互斥：来源中出现 "*" 时强制关闭凭证，防止任意站点越权读取 Cookie / Authorization
 CORS_ALLOW_CREDENTIALS = "*" not in CORS_ALLOW_ORIGINS
 if not CORS_ALLOW_CREDENTIALS:
-    print("[安全警告] CORS 来源白名单中包含通配符 \"*\"，已自动关闭 allow_credentials。")
+    logger.warning("[安全警告] CORS 来源白名单中包含通配符 \"*\"，已自动关闭 allow_credentials。")
+
+
+# ========== P2-2：有界推理线程池 ==========
+# 说明：MediaPipe 推理是 CPU 密集的同步调用，直接放在 /ws 协程里会阻塞整个事件循环，
+# 导致其他学生的 REST 请求（列表/记录/提醒）排队超时。这里用固定 4 个工作线程的池承接推理，
+# 线程名统一加 "infer" 前缀便于日志排查；进程退出时在 lifespan 中 shutdown。
+_INFER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="infer")
+
+# ========== P2-2：单学生背压集合 ==========
+# 记录「当前已有帧正在推理中」的学生 id：同一学生上一帧未算完时，新帧直接丢弃，
+# 避免弱网/低配机器上帧缓冲无限积压导致的雪崩。
+# 该集合只在事件循环线程内增删（工作线程不触碰），因此无需额外加锁。
+_inflight_students: set = set()
+
+
+# ========== P2-3：带 TTL 与容量上限的线程安全内存缓存 ==========
+class TTLCache:
+    """轻量 TTL + LRU 容量上限缓存（防止长期运行的全局字典无限膨胀导致 OOM）
+
+    设计要点：
+    - 用 OrderedDict 维护插入顺序，配合 move_to_end 实现 LRU 淘汰；
+    - 全部读写都在 RLock 保护下进行，可被事件循环线程与推理工作线程同时访问；
+    - get / items / __contains__ / __len__ 均会顺带判断过期（懒惰淘汰），
+      另有 cleanup() 供后台任务批量回收，返回本次实际清除的条数；
+    - set 时若 key 已存在先移除再插入，保证 LRU 顺序与「最新一次写入」一致。
+    """
+
+    def __init__(self, maxsize=1000, ttl=60.0):
+        self.maxsize = int(maxsize)
+        self.ttl = float(ttl)
+        self._store = OrderedDict()      # key -> (expire_at_ts, value)
+        self._lock = threading.RLock()
+
+    # ---------- 内部工具 ----------
+    def _is_expired(self, expire_at) -> bool:
+        """按单调时钟判断是否过期（避免系统时间回拨导致条目永不过期）"""
+        return expire_at <= time.monotonic()
+
+    def _purge_locked(self) -> int:
+        """在已持锁前提下清除所有过期条目，返回清除数量"""
+        now = time.monotonic()
+        dead = [k for k, (exp, _) in self._store.items() if exp <= now]
+        for k in dead:
+            self._store.pop(k, None)
+        return len(dead)
+
+    def _evict_locked(self):
+        """超容量时按 LRU 淘汰最旧条目"""
+        while len(self._store) > self.maxsize:
+            self._store.popitem(last=False)
+
+    # ---------- 对外接口 ----------
+    def set(self, key, value):
+        """写入/覆盖一条记录，TTL 从本次写入时刻重新计时"""
+        with self._lock:
+            self._store.pop(key, None)
+            self._store[key] = (time.monotonic() + self.ttl, value)
+            self._evict_locked()
+
+    def get(self, key, default=None):
+        """读取记录；不存在或已过期一律返回 default"""
+        with self._lock:
+            item = self._store.get(key)
+            if item is None:
+                return default
+            expire_at, value = item
+            if self._is_expired(expire_at):
+                # 懒惰淘汰：读到过期项立即清除，保证教师端不会看到离线学生的旧画面
+                self._store.pop(key, None)
+                return default
+            self._store.move_to_end(key)
+            return value
+
+    def pop(self, key, default=None):
+        """取出并删除（用于提醒的一次性消费）"""
+        with self._lock:
+            item = self._store.pop(key, None)
+            if item is None:
+                return default
+            expire_at, value = item
+            if self._is_expired(expire_at):
+                return default
+            return value
+
+    def cleanup(self) -> int:
+        """清除全部过期条目，返回清除数量（供后台 janitor 定时调用）"""
+        with self._lock:
+            return self._purge_locked()
+
+    def items(self):
+        """返回未过期条目的快照列表（调试接口用，避免持锁遍历时被外部修改）"""
+        with self._lock:
+            now = time.monotonic()
+            return [(k, v) for k, (exp, v) in self._store.items() if exp > now]
+
+    def __contains__(self, key) -> bool:
+        return self.get(key) is not None
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_locked()
+            return len(self._store)
+
+
+# ========== P2-3：后台缓存清理协程 ==========
+async def _cache_janitor():
+    """每 60 秒清理一次三个内存缓存中的过期条目（防 OOM）"""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            purged_video = student_video_cache.cleanup()
+            purged_online = online_students.cleanup()
+            purged_notice = student_notifications.cleanup()
+            if purged_video or purged_online or purged_notice:
+                logger.info(
+                    "[缓存清理] 过期回收：视频帧 %s 条 / 在线状态 %s 条 / 提醒 %s 条",
+                    purged_video, purged_online, purged_notice,
+                )
+        except asyncio.CancelledError:
+            # 生命周期结束时被 cancel，正常退出
+            raise
+        except Exception:
+            # 清理任务本身异常不能拖垮主服务
+            logger.exception("[缓存清理] 后台清理任务执行异常")
+
+
 # ========== MediaPipe 姿态识别 ==========
 # P1-6：数据库建表/迁移与模型加载统一放在 lifespan 中，
 # 保证无论是 `python app.py` 还是 `uvicorn app:app` 启动都会自动执行一次。
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期钩子：启动阶段完成建表、历史表迁移与专注度模型校验加载"""
+    """应用生命周期钩子：启动阶段完成建表、历史表迁移与专注度模型校验加载，
+    并启动缓存清理后台任务；关闭阶段优雅取消该任务并释放推理线程池。"""
     init_db()
     load_trained_model()
-    print("[启动] 数据库初始化与模型加载完成")
-    yield
-    print("[退出] 应用已关闭")
+    # P2-3：启动后台缓存清理任务
+    janitor_task = asyncio.create_task(_cache_janitor())
+    logger.info("[启动] 数据库初始化与模型加载完成，缓存清理任务已启动")
+    try:
+        yield
+    finally:
+        # P2-3：优雅取消后台清理任务
+        janitor_task.cancel()
+        try:
+            await janitor_task
+        except asyncio.CancelledError:
+            pass
+        # P2-2：不等待在途推理完成，避免退出阻塞（守护语义）
+        _INFER_POOL.shutdown(wait=False)
+        logger.info("[退出] 应用已关闭，后台任务与推理线程池已释放")
 
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
@@ -207,20 +383,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ========== P2-5：全局兜底异常处理器（对外脱敏） ==========
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc):
+    """兜底捕获未处理异常：日志留完整堆栈，响应只回通用安全提示
+
+    严禁把 str(exc)、异常类型名、堆栈等内部细节写进响应体，避免泄露表名、
+    文件路径、第三方接口地址等敏感实现细节。
+    """
+    logger.exception("未处理异常：%s %s", getattr(request, "method", "-"), getattr(request.url, "path", "-"))
+    return JSONResponse(status_code=500, content={"detail": "服务暂时不可用"})
+
+
 # ========== MediaPipe 初始化 ==========
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
-# P1-8：姿态推理参数不再硬编码，统一由 POSE_CONFIG 提供（默认值已对齐历史实际运行值）
-pose = mp_pose.Pose(**POSE_CONFIG)
-
-# ========== 新增：Face Mesh 初始化 ==========
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.3
-)
+
+# ========== P2-1：MediaPipe 实例按线程隔离（消除全局单例串台） ==========
+# 背景：MediaPipe 的 Pose / FaceMesh 对象内部持有 C++ 图与状态，不是线程安全的。
+# 原实现在模块加载时创建一份全局单例，被所有学生、所有工作线程共享，存在
+# 「学生 A 的推理结果被学生 B 的帧覆盖 / 崩溃」风险。
+# 现改为 threading.local() 按工作线程懒加载：每个推理线程各持一份独立实例。
+_MP_TLS = threading.local()
+
+
+def _build_pose_config():
+    """构造 Pose 初始化参数（P2-1：强制逐帧独立模式）"""
+    cfg = dict(POSE_CONFIG or {})
+    # 关键防串台修正：推理在公共线程池中调度，同一线程会先后服务不同学生。
+    # 若沿用视频流跟踪模式（static_image_mode=False），线程复用时上一帧的 ROI 跟踪框会
+    # 污染下一个学生的检测结果；因此这里强制 static_image_mode=True，逐帧独立、无状态检测。
+    cfg["static_image_mode"] = True
+    return cfg
+
+
+def _get_pose():
+    """获取当前线程独占的 Pose 实例（懒加载）"""
+    inst = getattr(_MP_TLS, "pose", None)
+    if inst is None:
+        inst = mp_pose.Pose(**_build_pose_config())
+        _MP_TLS.pose = inst
+    return inst
+
+
+def _get_face_mesh():
+    """获取当前线程独占的 FaceMesh 实例（懒加载，同样强制静态图模式）"""
+    inst = getattr(_MP_TLS, "face_mesh", None)
+    if inst is None:
+        inst = mp_face_mesh.FaceMesh(
+            static_image_mode=True,      # P2-1：逐帧独立检测，杜绝跨学生跟踪状态污染
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.3,
+        )
+        _MP_TLS.face_mesh = inst
+    return inst
 
 
 # ========== 模型加载（全局缓存，只加载一次）==========
@@ -324,7 +544,7 @@ def extract_model_features(landmarks):
             raise ValueError("特征包含非有限值（NaN/Inf）")
         return arr
     except Exception as e:
-        print(f"⚠️ 模型特征提取失败: {e}")
+        logger.warning("模型特征提取失败: %s", e)
         return None
 
 
@@ -369,7 +589,7 @@ def load_trained_model():
     # 开关关闭：直接进入纯规则引擎模式（不读文件、不校验哈希、不抛错）
     if (os.getenv(MODEL_ENABLE_ENV) or "0").strip() != "1":
         _cached_model_loaded = True   # 纯规则模式为稳定状态，可安全缓存
-        print(f"ℹ️ 当前处于纯规则引擎模式（未启用模型推理）：如需启用请设置 {MODEL_ENABLE_ENV}=1")
+        logger.info("当前处于纯规则引擎模式（未启用模型推理）：如需启用请设置 %s=1", MODEL_ENABLE_ENV)
         return None
 
     # 开关打开：模型文件、哈希、契约三者缺一不可，任何一步失败都直接抛错
@@ -408,8 +628,10 @@ def load_trained_model():
     _cached_model = model
     _cached_scaler = scaler
     _cached_model_loaded = True    # 仅在完全加载成功后置位，避免失败被缓存成「静默降级」
-    print(f"✅ 专注度模型已通过 SHA256 校验并加载: {MODEL_PATH} "
-          f"(特征维度={FEATURE_DIM}, 版本={FEATURE_VERSION}, 标准化={'是' if scaler is not None else '否'})")
+    logger.info(
+        "专注度模型已通过 SHA256 校验并加载: %s (特征维度=%s, 版本=%s, 标准化=%s)",
+        MODEL_PATH, FEATURE_DIM, FEATURE_VERSION, "是" if scaler is not None else "否",
+    )
     return _cached_model
 
 
@@ -428,7 +650,7 @@ def predict_focus(features):
         if _cached_scaler is not None:
             arr = _cached_scaler.transform(arr)
         if not hasattr(_cached_model, "predict_proba"):
-            print("⚠️ 模型推理失败: 当前模型不支持 predict_proba")
+            logger.warning("模型推理失败: 当前模型不支持 predict_proba")
             return None, 0.0
         proba = _cached_model.predict_proba(arr)[0]
         # 类别顺序约定为 [分心, 专注]（与训练脚本 classes_ 一致）；若模型自带 classes_ 则以其为准，
@@ -451,7 +673,7 @@ def predict_focus(features):
             "prob_distracted": prob_distracted,
         }, prob_focused
     except Exception as e:
-        print(f"⚠️ 模型推理失败: {e}")
+        logger.warning("模型推理失败: %s", e)
         return None, 0.0
 
 
@@ -463,7 +685,7 @@ def extract_pose_features(image_path):
             return None
         return extract_pose_features_from_frame(frame)
     except Exception as e:
-        print(f"⚠️ 特征提取失败: {e}")
+        logger.warning("特征提取失败: %s", e)
         return None
 
 
@@ -471,20 +693,25 @@ def extract_pose_features_from_frame(frame):
     """从内存中的视频帧提取 13 维姿态特征（避免磁盘 IO）"""
     try:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb_frame)
+        results = _get_pose().process(rgb_frame)
         if not results.pose_landmarks:
             return None
         return extract_model_features(results.pose_landmarks.landmark)
     except Exception as e:
-        print(f"⚠️ 内存特征提取失败: {e}")
+        logger.warning("内存特征提取失败: %s", e)
         return None
 
 # ========== 数据库初始化 ==========
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_study_buddy.db")
 
 def init_db():
-    """初始化数据库（含迁移逻辑）"""
-    conn = sqlite3.connect(DB_FILE)
+    """初始化数据库（建表 / 历史表迁移 / 索引创建 / 留存清理 / 管理员初始化）"""
+    with get_db() as conn:
+        _init_db_schema(conn)
+    logger.info("数据库初始化完成")
+
+def _init_db_schema(conn):
+    """init_db 的实际执行体（传入已开启 WAL 与事务的连接，提交与关闭由 get_db 统一负责）"""
     cursor = conn.cursor()
 
     # ===== 教师表 =====
@@ -509,7 +736,7 @@ def init_db():
         columns = [col[1] for col in cursor.fetchall()]
         if 'username' not in columns or 'password_hash' not in columns:
             need_migration = True
-            print("⚠️ 检测到旧版students表结构，正在迁移...")
+            logger.warning("检测到旧版 students 表结构，正在执行迁移")
 
     if need_migration:
         # 备份旧数据
@@ -541,7 +768,7 @@ def init_db():
         ''', (hash_password(secrets.token_urlsafe(16)),))
         # 删除旧表
         cursor.execute("DROP TABLE students_old")
-        print("✅ students表迁移完成")
+        logger.info("students 表迁移完成")
     else:
         # 直接创建表
         cursor.execute('''
@@ -581,7 +808,7 @@ def init_db():
     _br_columns = [col[1] for col in cursor.fetchall()]
     if "expire_at" not in _br_columns:
         cursor.execute("ALTER TABLE behavior_records ADD COLUMN expire_at TIMESTAMP")
-        print("✅ behavior_records 表已补充 expire_at 字段")
+        logger.info("behavior_records 表已补充 expire_at 字段")
     # 2) 回填历史记录的到期时间（写入时间 + 30 天）
     cursor.execute(
         "UPDATE behavior_records SET expire_at = datetime(created_at, '+30 days') "
@@ -594,7 +821,7 @@ def init_db():
         "   OR (expire_at IS NULL AND created_at < datetime('now', '-30 days'))"
     )
     if cursor.rowcount and cursor.rowcount > 0:
-        print(f"🧹 已清理 {cursor.rowcount} 条超过 30 天留存期的行为记录")
+        logger.info("已清理 %s 条超过 30 天留存期的行为记录", cursor.rowcount)
 
     # ===== 管理员账号初始化（P0-4：不再内置 teacher 默认弱口令）=====
     # 仅当环境变量 AI_STUDY_ADMIN_PASSWORD 非空、且库中不存在 teacher 账号时才创建
@@ -606,13 +833,19 @@ def init_db():
                 "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
                 ("teacher", hash_password(_admin_password))
             )
-            print("✅ 已依据环境变量 AI_STUDY_ADMIN_PASSWORD 初始化管理员账号：teacher")
+            logger.info("已依据环境变量 AI_STUDY_ADMIN_PASSWORD 初始化管理员账号：teacher")
         else:
-            print("ℹ️ 未配置环境变量 AI_STUDY_ADMIN_PASSWORD，跳过管理员账号初始化")
+            logger.info("未配置环境变量 AI_STUDY_ADMIN_PASSWORD，跳过管理员账号初始化")
 
-    conn.commit()
-    conn.close()
-    print("✅ 数据库初始化完成")
+    # ===== P2-4：复合索引（幂等创建）=====
+    # 用途：学生最新一条行为记录的查询（WHERE student_id=? ORDER BY created_at DESC LIMIT 1）
+    # 由全表扫描 + 临时排序，降为一次索引定位；教师端批量取最新记录的分组聚合也能借助
+    # student_id 有序前缀完成 GROUP BY，避免额外排序。
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_behavior_student_time "
+        "ON behavior_records(student_id, created_at DESC)"
+    )
+    logger.info("复合索引 idx_behavior_student_time 已就绪")
 
 # ========== JWT 认证工具 ==========
 def create_jwt_token(user_id: int, role: str, username: str) -> str:
@@ -680,14 +913,14 @@ def verify_password(password: str, hashed: str) -> bool:
 def upgrade_password_hash(role: str, user_id: int, new_hash: str) -> None:
     """将密码哈希原地升级（仅用于历史 SHA256 → bcrypt 的平滑迁移）"""
     table = "students" if role == "student" else "teachers"
+    # 表名由固定分支产生（非用户输入），不存在 SQL 注入风险
     try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE " + table + " SET password_hash = ? WHERE id = ?", (new_hash, user_id))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"⚠️ 密码哈希升级失败（{role}:{user_id}）：{e}")
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE " + table + " SET password_hash = ? WHERE id = ?", (new_hash, user_id))
+    except Exception:
+        # 内部堆栈只进日志，绝不返回给前端
+        logger.exception("密码哈希升级失败（%s:%s）", role, user_id)
 
 # ========== 登录失败限速（P0-4） ==========
 _LOGIN_MAX_FAILS = 5          # 连续失败次数上限
@@ -759,50 +992,63 @@ class LoginRequest(BaseModel):
     password: str
 
 # ========== 数据库操作 ==========
+# P2-4：get_db 改为上下文管理器，统一连接开箱参数与自动事务收尾
+@contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    """数据库连接上下文管理器
+
+    统一行为（每次取连接即就位，避免各处漏设 PRAGMA）：
+      1) journal_mode=WAL：读写并发互不阻塞，学生持续写行为记录时教师端查询不会长时间被锁；
+      2) foreign_keys=ON：SQLite 默认不启用外键约束，这里显式打开以保证引用完整性；
+      3) synchronous=NORMAL：WAL 模式下兼顾安全与写入性能的平衡点；
+      4) 正常退出自动 commit()，抛异常自动 rollback()，finally 必定 close()。
+    使用方式统一为 `with get_db() as conn:`，不再需要散落的手动 close()。
+    """
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def get_teacher_by_username(username: str):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM teachers WHERE username = ?", (username,))
-    teacher = cursor.fetchone()
-    conn.close()
-    return teacher
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM teachers WHERE username = ?", (username,))
+        return cursor.fetchone()
 
 def get_student_by_username(username: str):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM students WHERE username = ?", (username,))
-    student = cursor.fetchone()
-    conn.close()
-    return student
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM students WHERE username = ?", (username,))
+        return cursor.fetchone()
 
 def create_student(username: str, password: str, name: str, student_no: str, class_name: str):
-    conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute(
-            "INSERT INTO students (username, password_hash, name, student_no, class_name) VALUES (?, ?, ?, ?, ?)",
-            (username, hash_password(password), name, student_no, class_name)
-        )
-        conn.commit()
-        student_id = cursor.lastrowid
-        conn.close()
-        return student_id
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO students (username, password_hash, name, student_no, class_name) VALUES (?, ?, ?, ?, ?)",
+                (username, hash_password(password), name, student_no, class_name)
+            )
+            return cursor.lastrowid
     except sqlite3.IntegrityError:
-        conn.close()
+        # 用户名唯一约束冲突：交由上层返回友好提示
         return None
 
 def get_all_students():
     """教师获取所有学生"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students ORDER BY created_at DESC")
-    students = cursor.fetchall()
-    conn.close()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students ORDER BY created_at DESC")
+        students = cursor.fetchall()
     result = []
     for s in students:
         item = dict(s)
@@ -811,11 +1057,10 @@ def get_all_students():
     return result
 
 def get_student_by_id(student_id: int):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students WHERE id = ?", (student_id,))
-    student = cursor.fetchone()
-    conn.close()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students WHERE id = ?", (student_id,))
+        student = cursor.fetchone()
     if not student:
         return None
     item = dict(student)
@@ -823,19 +1068,17 @@ def get_student_by_id(student_id: int):
     return item
 
 def save_behavior_record(student_id: int, data: dict):
-    conn = get_db()
-    cursor = conn.cursor()
     # P0-10：写入时即设定 30 天留存到期时间（SQLite datetime('now') 为 UTC，与 created_at 默认值一致）
-    cursor.execute(
-        """INSERT INTO behavior_records
-           (student_id, focus_score, distraction_count, head_pose, body_stability, fatigue_level, eye_focus, suggestion, model_prediction, expire_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+30 days'))""",
-        (student_id, data.get("focus_score"), data.get("distraction_count"),
-         data.get("head_pose"), data.get("body_stability"), data.get("fatigue_level"),
-         data.get("eye_focus"), data.get("suggestion"), data.get("model_prediction"))
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO behavior_records
+               (student_id, focus_score, distraction_count, head_pose, body_stability, fatigue_level, eye_focus, suggestion, model_prediction, expire_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+30 days'))""",
+            (student_id, data.get("focus_score"), data.get("distraction_count"),
+             data.get("head_pose"), data.get("body_stability"), data.get("fatigue_level"),
+             data.get("eye_focus"), data.get("suggestion"), data.get("model_prediction"))
+        )
 
 def normalize_record_times(record: dict) -> dict:
     """P1-7：把行为记录中的时间字段统一转成带 Z 的 ISO-8601，前端按本地时区正确渲染"""
@@ -847,27 +1090,56 @@ def normalize_record_times(record: dict) -> dict:
     return record
 
 def get_student_behavior_records(student_id: int, limit: int = 50):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT * FROM behavior_records WHERE student_id = ? ORDER BY created_at DESC LIMIT ?",
-        (student_id, limit)
-    )
-    records = cursor.fetchall()
-    conn.close()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM behavior_records WHERE student_id = ? ORDER BY created_at DESC LIMIT ?",
+            (student_id, limit)
+        )
+        records = cursor.fetchall()
     return [normalize_record_times(dict(r)) for r in records]
 
 def get_student_latest_record(student_id: int):
-    """获取学生最新一条行为记录"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT * FROM behavior_records WHERE student_id = ? ORDER BY created_at DESC LIMIT 1",
-        (student_id,)
-    )
-    record = cursor.fetchone()
-    conn.close()
+    """获取学生最新一条行为记录（依赖复合索引 idx_behavior_student_time，走索引定位无需回扫）"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM behavior_records WHERE student_id = ? ORDER BY created_at DESC LIMIT 1",
+            (student_id,)
+        )
+        record = cursor.fetchone()
     return normalize_record_times(dict(record)) if record else None
+
+def get_latest_records_for_students(student_ids):
+    """一次性批量取出多个学生各自的最新一条行为记录（P2-4：消除教师端列表的 N+1 查询）
+
+    原实现是在教师端学生列表的 for 循环里逐个调用 get_student_latest_record()，
+    20 个学生就会触发 21 次数据库查询（N+1）。这里改为「一条 GROUP BY 聚合 + JOIN」：
+    先用子查询按 student_id 分组取 MAX(id)（id 自增，最大值即该学生最新写入的记录），
+    再 JOIN 回主表取回完整字段，无论多少个学生查库次数恒为 1 次。
+    聚合子查询只涉及 (student_id, id)，可借助复合索引 idx_behavior_student_time 的
+    student_id 有序前缀完成分组，避免全表排序。
+    """
+    if not student_ids:
+        return {}
+    id_list = [int(x) for x in student_ids]
+    placeholders = ",".join("?" for _ in id_list)
+    sql = (
+        "SELECT b.* FROM behavior_records b "
+        "JOIN ("
+        "  SELECT student_id, MAX(id) AS latest_id FROM behavior_records "
+        "  WHERE student_id IN (" + placeholders + ") GROUP BY student_id"
+        ") m ON m.latest_id = b.id"
+    )
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, tuple(id_list))
+        rows = cursor.fetchall()
+    latest_map = {}
+    for r in rows:
+        item = normalize_record_times(dict(r))
+        latest_map[item.get("student_id")] = item
+    return latest_map
 
 # ========== API 路由 ==========
 
@@ -892,20 +1164,17 @@ async def teacher_register(request: LoginRequest):
     if len(request.username) < 3 or len(request.password) < 6:
         raise HTTPException(status_code=400, detail="用户名至少3位，密码至少6位")
     
-    conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute(
-            "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
-            (request.username, hash_password(request.password))
-        )
-        conn.commit()
-        teacher_id = cursor.lastrowid
-        conn.close()
-        return {"message": "注册成功", "teacher_id": teacher_id}
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
+                (request.username, hash_password(request.password))
+            )
+            teacher_id = cursor.lastrowid
     except sqlite3.IntegrityError:
-        conn.close()
         raise HTTPException(status_code=400, detail="用户名已存在")
+    return {"message": "注册成功", "teacher_id": teacher_id}
 
 # --- 学生登录 ---
 @app.post("/api/student/login")
@@ -982,13 +1251,15 @@ async def teacher_list_students(user: dict = Depends(get_current_user)):
     if user.get("role") != "teacher":
         raise HTTPException(status_code=403, detail="仅教师可访问")
     students = get_all_students()
-    # 为每个学生附加最新行为记录和在线状态
+    # P2-4：先一次性批量取回所有学生的最新行为记录（查库次数恒为 1，彻底消除 N+1），
+    # 再在内存里做归并，避免原实现「循环内逐个查库」在 20 个学生时触发 21 次查询。
+    latest_map = get_latest_records_for_students([s["id"] for s in students])
     for s in students:
-        latest = get_student_latest_record(s["id"])
-        s["latest_record"] = latest
-        # 检查在线状态（最近10秒有视频帧更新）
+        # 附加最新行为记录（无记录则为 None，前端按空态渲染）
+        s["latest_record"] = latest_map.get(s["id"])
+        # 检查在线状态：视频帧缓存 TTL 为 10 秒，取得到即视为在线
         cache = get_student_video_cache(s["id"])
-        if cache and (time.time() - cache["timestamp"]) < 10:
+        if cache:
             s["online"] = True
             s["live_focus_score"] = cache["focus_score"]
         else:
@@ -1025,16 +1296,46 @@ async def teacher_get_student_live(student_id: int, user: dict = Depends(get_cur
             "message": "学生未在线或未开启监控"
         }
     
-    # 检查是否在最近10秒有更新
-    is_online = (time.time() - cache["timestamp"]) < 10
+    # P2-3：视频帧缓存 TTL=10s，取到即说明最近 10 秒内有更新；此处再按时间戳二次校验
+    is_online = (time.time() - cache.get("timestamp", 0)) < 10
     
     return {
         "student_id": student_id,
         "online": is_online,
-        "image": cache["image"],
+        # P2-6：不再内联 base64 大图（单帧可达数百 KB，2 秒轮询会让教师端带宽爆掉），
+        # 只回状态与分数；画面由 GET /api/teacher/students/{id}/snapshot.jpg 提供。
+        "has_image": bool(cache.get("image")),
         "focus_score": cache["focus_score"],
         "timestamp": cache["timestamp"]
     }
+
+# --- 教师拉取学生最新画面快照（P2-6）---
+@app.get("/api/teacher/students/{student_id}/snapshot.jpg")
+async def teacher_get_student_snapshot(student_id: int, user: dict = Depends(get_current_user)):
+    """教师端拉取学生最新一帧画面（二进制 JPEG）
+
+    背景：/ws 不再下行整帧 base64 图像，原始画面只留在服务端缓存里，
+    教师端需要看图时走这个受鉴权保护的二进制接口，避免 base64 膨胀 33% 与 JSON 解析开销。
+    无画面、缓存过期、解码失败统一返回 404，不向外暴露任何内部异常信息。
+    """
+    if user.get("role") != "teacher":
+        raise HTTPException(status_code=403, detail="仅教师可访问")
+    cache = get_student_video_cache(student_id)
+    if not cache:
+        raise HTTPException(status_code=404, detail="暂无画面")
+    image_b64 = cache.get("image") or ""
+    if not image_b64:
+        raise HTTPException(status_code=404, detail="暂无画面")
+    try:
+        raw = base64.b64decode(image_b64)
+    except Exception:
+        # 内部解码异常只进日志，对外统一 404
+        logger.exception("学生 %s 画面快照解码失败", student_id)
+        raise HTTPException(status_code=404, detail="暂无画面")
+    if not raw:
+        raise HTTPException(status_code=404, detail="暂无画面")
+    # 画面实时变化，禁止浏览器/中间层缓存，否则教师端会看到旧帧
+    return Response(content=raw, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 # --- 学生保存自己的行为数据 ---
 @app.post("/api/student/behavior")
@@ -1062,8 +1363,8 @@ class VolcEngineASR:
             }, timeout=5)
             if resp.status_code == 200:
                 return resp.json().get("access_token", "")
-        except Exception as e:
-            print(f"⚠️ 获取火山引擎Token失败: {e}")
+        except Exception:
+            logger.warning("获取火山引擎 Token 失败", exc_info=True)
         return ""
 
     def recognize_audio(self, audio_bytes, sample_rate=16000):
@@ -1085,8 +1386,8 @@ class VolcEngineASR:
             if resp.status_code == 200:
                 result = resp.json()
                 return result.get("result", {}).get("text", "")
-        except Exception as e:
-            print(f"⚠️ 语音识别失败: {e}")
+        except Exception:
+            logger.warning("语音识别失败", exc_info=True)
         return None
 
 asr_engine = VolcEngineASR(VOLC_ACCESS_KEY, VOLC_SECRET_KEY)
@@ -1121,11 +1422,11 @@ class MediaPipePoseAnalyzer:
             self.model_loaded = model is not None
             if self.model_loaded:
                 self.model_n_features = int(getattr(model, 'n_features_in_', FEATURE_DIM))
-                print(f"✅ 专注度模型已加载 (特征维度={self.model_n_features})")
+                logger.info("专注度模型已加载（特征维度=%s）", self.model_n_features)
             else:
-                print("ℹ️ 专注度预测模型未启用，当前使用纯规则引擎分析")
+                logger.info("专注度预测模型未启用，当前使用纯规则引擎分析")
         except Exception as e:
-            print(f"⚠️ 模型检查失败: {e}")
+            logger.warning("模型检查失败", exc_info=True)
             self.model_loaded = False
 
     def _extract_model_features(self, landmarks):
@@ -1140,8 +1441,9 @@ class MediaPipePoseAnalyzer:
             if frame is None:
                 return self._fallback_analysis(scene, image_base64)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb_frame)
-            face_results = face_mesh.process(rgb_frame)
+            # P2-1：从 threading.local 取当前工作线程独占的实例，避免多学生并发串台
+            results = _get_pose().process(rgb_frame)
+            face_results = _get_face_mesh().process(rgb_frame)
             if not results.pose_landmarks:
                 return self._fallback_analysis(scene, image_base64)
             landmarks = results.pose_landmarks.landmark
@@ -1223,8 +1525,11 @@ class MediaPipePoseAnalyzer:
                         model_meta = model_prediction
                         score_source = "rule+model"
                     elif model_prediction is not None:
-                        print(f"ℹ️ 模型置信度 {model_conf:.2f} 低于门限 {MODEL_MIN_CONFIDENCE}，本次仅采用规则结论")
-            print(f"📊 规则分={rule_score} 最终={focus_score} 来源={score_source} 姿态={head_pose_status} 眼神={eye_focus_status} 疲劳={fatigue_status}")
+                        logger.debug("模型置信度 %.2f 低于门限 %.2f，本次仅采用规则结论", model_conf, MODEL_MIN_CONFIDENCE)
+            logger.debug(
+            "评分明细 规则分=%s 最终=%s 来源=%s 姿态=%s 眼神=%s 疲劳=%s",
+            rule_score, focus_score, score_source, head_pose_status, eye_focus_status, fatigue_status,
+        )
 
             # ========== 时序平滑 ==========
             focus_score = self._smooth_focus_score(focus_score)
@@ -1241,14 +1546,15 @@ class MediaPipePoseAnalyzer:
                     # 自动发送语音提醒到学生端
                     try:
                         reminder_msg = self._generate_suggestion(focus_score, head_pose_status, fatigue_status, scene)
-                        student_notifications[student_id] = {
+                        # P2-3：TTLCache 内部带锁且带容量上限，工作线程写入安全
+                        student_notifications.set(student_id, {
                             "student_id": student_id,
                             "message": reminder_msg,
                             "timestamp": time.time(),
                             "type": "voice"
-                        }
-                    except Exception as e:
-                        print(f"⚠️ 发送提醒失败: {e}")
+                        })
+                    except Exception:
+                        logger.exception("发送提醒失败（student_id=%s）", student_id)
             else:
                 self.consecutive_low_focus = max(0, self.consecutive_low_focus - 1)
 
@@ -1259,7 +1565,7 @@ class MediaPipePoseAnalyzer:
             action_label = self._smooth_action(raw_action)
             action_cn = {"focused": "专注", "sleep": "睡觉", "playphone": "玩手机", "distracted": "分心"}.get(action_label, action_label)
             if action_label != "focused":
-                print(f"🏷️ 动作分类: {action_cn} ({action_label})")
+                logger.debug("动作分类: %s (%s)", action_cn, action_label)
 
             # P1-4：构建模型分轨信息（仅高置信度时才有内容，便于前端透明展示）
             model_info = ""
@@ -1287,8 +1593,9 @@ class MediaPipePoseAnalyzer:
                 "rule_score": rule_score,
                 "pose_stability": round(pose_stability, 2)
             }
-        except Exception as e:
-            print(f"⚠️ MediaPipe分析异常: {e}")
+        except Exception:
+            # P2-5：完整堆栈只进日志；对外仍返回可用的兜底结果，不携带任何异常文本
+            logger.exception("MediaPipe 分析异常（student_id=%s）", student_id)
             return self._fallback_analysis(scene, image_base64)
 
     def _draw_skeleton(self, frame, landmarks):
@@ -1516,10 +1823,10 @@ class MediaPipePoseAnalyzer:
         # 调试输出（帮助诊断）
         debug_info = f"[DEBUG] hand_L={left_hand_valid} hand_R={right_hand_valid} elbow_L={left_elbow_bent} elbow_R={right_elbow_bent} lw_y={left_wrist.y:.3f} le_y={left_elbow.y:.3f}"
         if any_hand_in_torso and any_elbow_bent:
-            print(f"🏷️ {debug_info} -> playphone")
+            logger.debug("%s -> playphone", debug_info)
             return "playphone"
         elif any_hand_in_torso or any_elbow_bent:
-            print(f"🏷️ {debug_info} -> distracted (partial match)")
+            logger.debug("%s -> distracted (partial match)", debug_info)
 
         # ===== 默认：普通分心 =====
         return "distracted"
@@ -1602,16 +1909,19 @@ class MediaPipePoseAnalyzer:
 
 analyzer = MediaPipePoseAnalyzer()
 
-# ========== 学生实时视频帧缓存 ==========
-student_video_cache = {}
-student_notifications = {}  # 存储学生语音提醒
-online_students = {}  # 存储在线学生信息
+# ========== 学生实时视频帧缓存（P2-3：TTL + 容量上限，防 OOM）==========
+# 视频帧：10 秒无更新即视为离线自动过期；容量上限 200，超出按 LRU 淘汰
+student_video_cache = TTLCache(maxsize=200, ttl=10)
+# 语音提醒：学生端一次性消费，5 分钟未取自动过期，避免堆积
+student_notifications = TTLCache(maxsize=1000, ttl=300)
+# 在线学生状态：60 秒无心跳视为离线
+online_students = TTLCache(maxsize=500, ttl=60)
 
 def update_student_video_cache(student_id: int, annotated_image: str, focus_score: int,
                                  action_label="unknown", head_pose="", eye_focus="", fatigue_level="",
                                  name=""):
-    """更新学生视频帧缓存"""
-    student_video_cache[student_id] = {
+    """更新学生视频帧缓存（TTLCache 内部加锁，可被推理工作线程安全调用）"""
+    student_video_cache.set(student_id, {
         "image": annotated_image,
         "timestamp": time.time(),
         "focus_score": focus_score,
@@ -1620,10 +1930,10 @@ def update_student_video_cache(student_id: int, annotated_image: str, focus_scor
         "eye_focus": eye_focus,
         "fatigue_level": fatigue_level,
         "name": name
-    }
+    })
 
 def get_student_video_cache(student_id: int):
-    """获取学生视频帧缓存"""
+    """获取学生视频帧缓存（过期或不存在返回 None）"""
     return student_video_cache.get(student_id)
 
 
@@ -1661,7 +1971,7 @@ async def ws_endpoint(websocket: WebSocket):
         return
 
     await websocket.accept()
-    print(f"✅ 客户端已连接（student_id={student_id}）")
+    logger.info("客户端已连接（student_id=%s）", student_id)
     current_student_id = student_id
 
     # ===== P1-5：握手鉴权通过后只查一次数据库，取真实姓名缓存，帧循环内直接复用 =====
@@ -1670,13 +1980,15 @@ async def ws_endpoint(websocket: WebSocket):
         student_info = get_student_by_id(student_id)
         if student_info and student_info.get("name"):
             student_name = student_info["name"]
-    except Exception as e:
-        # 查询失败时降级为默认显示名，且不影响监控主流程
-        print(f"⚠️ 获取学生姓名失败（student_id={student_id}）：{e}")
+    except Exception:
+        # 查询失败时降级为默认显示名，且不影响监控主流程；完整堆栈只进日志
+        logger.warning("获取学生姓名失败（student_id=%s）", student_id, exc_info=True)
 
     # 若该学生此前已有在线记录，同步刷新姓名，避免继续显示旧的占位名
-    if student_id in online_students:
-        online_students[student_id]["name"] = student_name
+    cached_online = online_students.get(student_id)
+    if cached_online:
+        cached_online["name"] = student_name
+        online_students.set(student_id, cached_online)
 
     try:
         while True:
@@ -1685,8 +1997,29 @@ async def ws_endpoint(websocket: WebSocket):
             if "image" in msg:
                 scene = msg.get("scene", "selfstudy")
                 # P0-1：身份已由令牌绑定，忽略消息体中的 student_id
-                result = analyzer.analyze(msg["image"], scene, student_id)
-                
+
+                # ===== P2-2：单学生背压——上一帧尚未算完则直接丢弃当前帧 =====
+                # 学生端 1 秒 1 帧，正常情况推理远快于 1 秒；一旦某帧卡住，
+                # 直接返回 skipped 让前端跳过而不排队，避免帧缓冲无限积压。
+                if student_id in _inflight_students:
+                    await websocket.send_json({"skipped": True, "reason": "上一帧仍在处理中"})
+                    continue
+
+                _inflight_students.add(student_id)
+                try:
+                    # ===== P2-2：推理移入有界线程池，不阻塞主事件循环 =====
+                    # 同一学生同一时刻最多一个推理任务在跑，因此不会与其自身状态竞争；
+                    # 不同学生会被调度到不同工作线程，各自持有 threading.local 的
+                    # MediaPipe 实例（P2-1），互不串台。
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(
+                        _INFER_POOL, analyzer.analyze, msg["image"], scene, student_id
+                    )
+                finally:
+                    # 无论推理成功、异常还是被取消，都必须释放背压标记，
+                    # 否则该学生后续帧会被永久丢弃。
+                    _inflight_students.discard(student_id)
+
                 # 缓存学生视频帧（供教师实时查看）
                 if student_id and result.get("annotated_image"):
                     update_student_video_cache(
@@ -1700,25 +2033,35 @@ async def ws_endpoint(websocket: WebSocket):
                         name=student_name
                     )
                     result["student_id"] = student_id
-                    # 更新在线学生列表
-                    online_students[student_id] = {
+                    # 更新在线学生列表（TTLCache：60 秒无心跳自动过期）
+                    online_students.set(student_id, {
                         "name": student_name,
                         "focus_score": result.get("focus_score", 0),
                         "status": result.get("action_label", "unknown"),
                         "last_seen": time.time()
-                    }
-                
+                    })
+
+                # ===== P2-6：下行瘦身——不再回传整帧 base64 大图 =====
+                # 原始画面已存入 student_video_cache，教师端需要看图时走
+                # GET /api/teacher/students/{id}/snapshot.jpg 拉二进制 JPEG。
+                # 这里只保留分数/状态/警告等轻量字段，单条消息控制在 1KB 以内。
+                result.pop("annotated_image", None)
                 await websocket.send_json(result)
             elif msg.get("action") == "encouragement":
-                print(f"💪 收到鼓励: {msg.get('message', '')}")
+                logger.info("收到鼓励（student_id=%s）: %s", student_id, msg.get("message", ""))
             elif msg.get("action") == "asr_result":
-                print(f"🎙️ 语音识别: {msg.get('text', '')}")
-    except Exception as e:
-        print("❌ 连接断开：", e)
+                logger.info("语音识别（student_id=%s）: %s", student_id, msg.get("text", ""))
+    except WebSocketDisconnect:
+        # 正常断开（前端关闭页面/刷新），只记一条 info
+        logger.info("客户端断开连接（student_id=%s）", student_id)
+    except Exception:
+        # P2-5：异常断开完整堆栈进日志，不向客户端回传异常文本
+        logger.exception("WebSocket 会话异常（student_id=%s）", student_id)
     finally:
-        # 断开时从在线列表移除
-        if current_student_id and current_student_id in online_students:
-            del online_students[current_student_id]
+        # 断开时从在线列表移除，并清掉可能残留的背压标记
+        if current_student_id:
+            online_students.pop(current_student_id, None)
+            _inflight_students.discard(current_student_id)
 
 
 # ========== 前端页面（已抽离至 templates/index.html） ==========
@@ -1775,20 +2118,18 @@ async def delete_my_student_data(user: dict = Depends(get_current_user)):
 
     student_id = user.get("user_id")
 
-    # 1) 删除数据库中的全部行为记录
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM behavior_records WHERE student_id = ?", (student_id,))
-    deleted_records = cursor.rowcount or 0
-    conn.commit()
-    conn.close()
+    # 1) 删除数据库中的全部行为记录（with 自动 commit / rollback / close）
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM behavior_records WHERE student_id = ?", (student_id,))
+        deleted_records = cursor.rowcount or 0
 
     # 2) 清理内存缓存：实时画面、在线状态、待推送提醒
     student_video_cache.pop(student_id, None)
     online_students.pop(student_id, None)
     student_notifications.pop(student_id, None)
 
-    print(f"🧹 学生 {student_id} 已删除本人数据，共 {deleted_records} 条行为记录")
+    logger.info("学生 %s 已删除本人数据，共 %s 条行为记录", student_id, deleted_records)
     return {
         "success": True,
         "deleted_records": deleted_records,
@@ -1798,9 +2139,9 @@ async def delete_my_student_data(user: dict = Depends(get_current_user)):
 if __name__ == "__main__":
     # P1-6：建表、迁移与模型加载已统一由 lifespan 负责，此处不再重复调用 init_db()
     # P1-8：启动主机与端口改为读取 config 中的 HOST / PORT（此前为硬编码，配置项形同虚设）
-    print("=" * 50)
-    print("🎓 AI学伴 · 专注度智能监护系统")
-    print(f"📍 访问地址: http://{HOST}:{PORT}")
-    print("👤 学生: 注册后登录 → 进入专注度监控")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info("AI学伴 · 专注度智能监护系统")
+    logger.info("访问地址: http://%s:%s", HOST, PORT)
+    logger.info("学生: 注册后登录 → 进入专注度监控")
+    logger.info("=" * 50)
     uvicorn.run(app, host=HOST, port=PORT)

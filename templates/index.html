@@ -953,6 +953,28 @@
             }).join('');
         }
 
+        // P2-6：教师端画面改用二进制快照接口，用完即释放 ObjectURL，避免内存泄漏
+        let liveSnapshotUrl = null;
+
+        async function refreshStudentSnapshot(studentId, imgEl) {
+            try {
+                // 带时间戳参数绕过浏览器缓存（服务端已返回 no-store）
+                const response = await apiRequest(`/api/teacher/students/${studentId}/snapshot.jpg?t=${Date.now()}`);
+                if (!response) return;
+                if (!response.ok) {
+                    // 404 表示学生暂无画面，保持上一帧不动即可
+                    return;
+                }
+                const blob = await response.blob();
+                if (liveSnapshotUrl) URL.revokeObjectURL(liveSnapshotUrl);
+                liveSnapshotUrl = URL.createObjectURL(blob);
+                imgEl.src = liveSnapshotUrl;
+                imgEl.alt = '学生实时画面';
+            } catch (e) {
+                console.error('拉取学生画面快照失败:', e);
+            }
+        }
+
         async function refreshStudentLive() {
             if (!currentViewingStudentId) return;
             try {
@@ -967,9 +989,8 @@
                 if (data.online) {
                     statusEl.className = 'status-badge online';
                     statusEl.innerHTML = '🟢 在线';
-                    if (data.image) {
-                        imgEl.src = 'data:image/jpeg;base64,' + data.image;
-                    }
+                    // 画面单独走二进制快照接口拉取
+                    refreshStudentSnapshot(currentViewingStudentId, imgEl);
                     const score = data.focus_score || 0;
                     const scoreColor = score >= 70 ? '#34d399' : score >= 40 ? '#fbbf24' : '#f87171';
                     scoreEl.innerHTML = `专注度: <span style="color: ${scoreColor};">${score}%</span>`;
@@ -979,6 +1000,7 @@
                     scoreEl.innerHTML = '专注度: --';
                     imgEl.src = '';
                     imgEl.alt = data.message || '学生未在线';
+                    if (liveSnapshotUrl) { URL.revokeObjectURL(liveSnapshotUrl); liveSnapshotUrl = null; }
                 }
             } catch (e) {
                 console.error('刷新实时画面失败:', e);
@@ -1112,7 +1134,8 @@
         function initMonitor() {
             initCamera();
             initWebSocket();
-            frameInterval = setInterval(sendFrame, 500);
+            // P2-6：上传频率由 2 帧/秒降为 1 帧/秒，配合长边缩放与 JPEG 0.6 压缩，上行流量约降为原来 1/6
+        frameInterval = setInterval(sendFrame, 1000);
             renderTrend();
             initASR();
             loadPreferredVoice();
@@ -1237,12 +1260,19 @@
         async function sendFrame() {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             if (!videoElement || videoElement.readyState < 2) return;
-            const canvas = document.createElement('canvas');
-            canvas.width = videoElement.videoWidth || 640;
-            canvas.height = videoElement.videoHeight || 480;
+            // P2-6：直接复用页面上的 poseCanvas 做本地预览 + 上传取样，避免每帧新建 canvas 造成 GC 抖动
+            const canvas = document.getElementById('poseCanvas');
+            const vw = videoElement.videoWidth || 640;
+            const vh = videoElement.videoHeight || 480;
+            // 长边等比缩放至不超过 480px：分辨率降为原来的 1/4 左右，后端解码与 MediaPipe 推理都更快
+            const scale = Math.min(1, 480 / Math.max(vw, vh));
+            const w = Math.max(1, Math.round(vw * scale));
+            const h = Math.max(1, Math.round(vh * scale));
+            if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
             const ctx = canvas.getContext('2d');
-            ctx.drawImage(videoElement, 0, 0);
-            const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
+            ctx.drawImage(videoElement, 0, 0, w, h);
+            // JPEG 质量 0.6：人像姿态识别足够，体积约为 0.9 的一半
+            const base64 = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
             // P0-1：身份由服务端按令牌绑定，消息体不再传 student_id
             ws.send(JSON.stringify({ image: base64, scene: currentScene }));
         }
@@ -1314,6 +1344,8 @@
             document.getElementById('focusValue').innerText = focus + '%';
             document.getElementById('focusScore').innerText = focus;
             document.getElementById('focusRing').style.setProperty('--focus', focus + '%');
+            // P2-6：服务端已不再下行回传骨架标注图（下行消息只含轻量 JSON），
+            // 学生端画面由本地 sendFrame 直接绘制摄像头原图；此分支仅保留向后兼容。
             if (data.annotated_image) {
                 const canvas = document.getElementById('poseCanvas'), ctx = canvas.getContext('2d'), img = new Image();
                 img.onload = () => { canvas.width = img.width; canvas.height = img.height; ctx.drawImage(img, 0, 0); };
