@@ -26,7 +26,8 @@ import sqlite3
 import bcrypt
 import jwt
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,7 +105,18 @@ CORS_ALLOW_CREDENTIALS = "*" not in CORS_ALLOW_ORIGINS
 if not CORS_ALLOW_CREDENTIALS:
     print("[安全警告] CORS 来源白名单中包含通配符 \"*\"，已自动关闭 allow_credentials。")
 # ========== MediaPipe 姿态识别 ==========
-app = FastAPI()
+# P1-6：数据库建表/迁移与模型加载统一放在 lifespan 中，
+# 保证无论是 `python app.py` 还是 `uvicorn app:app` 启动都会自动执行一次。
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期钩子：启动阶段完成建表、历史表迁移与专注度模型校验加载"""
+    init_db()
+    load_trained_model()
+    print("[启动] 数据库初始化与模型加载完成")
+    yield
+    print("[退出] 应用已关闭")
+
+app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
 
 app.add_middleware(
@@ -455,14 +467,19 @@ def init_db():
 
 # ========== JWT 认证工具 ==========
 def create_jwt_token(user_id: int, role: str, username: str) -> str:
-    """创建JWT令牌，包含角色信息"""
-    expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
+    """创建JWT令牌，包含角色信息
+
+    P1-7：统一使用带时区的 datetime.now(timezone.utc)，替代已弃用的 datetime.utcnow()，
+    避免生成无时区信息的“朴素时间”导致前后端解析出现 8 小时偏差。
+    """
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(days=JWT_EXPIRE_DAYS)
     payload = {
         "sub": username,
         "user_id": user_id,
         "role": role,
         "exp": expire,
-        "iat": datetime.utcnow()
+        "iat": now
     }
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
@@ -480,6 +497,14 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     """获取当前登录用户"""
     token = credentials.credentials
     return verify_jwt_token(token)
+
+# ========== 时间格式工具（P1-7） ==========
+def to_iso_utc(v):
+    """将 SQLite 存储的 UTC 时间字符串转为带 Z 后缀的 ISO-8601 格式"""
+    if not v:
+        return None
+    s = str(v).replace(" ", "T")
+    return s if s.endswith("Z") or "+" in s else s + "Z"
 
 # ========== 密码安全（P0-4） ==========
 def hash_password(password: str) -> str:
@@ -629,7 +654,12 @@ def get_all_students():
     cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students ORDER BY created_at DESC")
     students = cursor.fetchall()
     conn.close()
-    return [dict(s) for s in students]
+    result = []
+    for s in students:
+        item = dict(s)
+        item["created_at"] = to_iso_utc(item.get("created_at"))
+        result.append(item)
+    return result
 
 def get_student_by_id(student_id: int):
     conn = get_db()
@@ -637,7 +667,11 @@ def get_student_by_id(student_id: int):
     cursor.execute("SELECT id, username, name, student_no, class_name, created_at FROM students WHERE id = ?", (student_id,))
     student = cursor.fetchone()
     conn.close()
-    return dict(student) if student else None
+    if not student:
+        return None
+    item = dict(student)
+    item["created_at"] = to_iso_utc(item.get("created_at"))
+    return item
 
 def save_behavior_record(student_id: int, data: dict):
     conn = get_db()
@@ -654,6 +688,15 @@ def save_behavior_record(student_id: int, data: dict):
     conn.commit()
     conn.close()
 
+def normalize_record_times(record: dict) -> dict:
+    """P1-7：把行为记录中的时间字段统一转成带 Z 的 ISO-8601，前端按本地时区正确渲染"""
+    if not record:
+        return record
+    for key in ("created_at", "expire_at"):
+        if key in record:
+            record[key] = to_iso_utc(record.get(key))
+    return record
+
 def get_student_behavior_records(student_id: int, limit: int = 50):
     conn = get_db()
     cursor = conn.cursor()
@@ -663,7 +706,7 @@ def get_student_behavior_records(student_id: int, limit: int = 50):
     )
     records = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in records]
+    return [normalize_record_times(dict(r)) for r in records]
 
 def get_student_latest_record(student_id: int):
     """获取学生最新一条行为记录"""
@@ -675,7 +718,7 @@ def get_student_latest_record(student_id: int):
     )
     record = cursor.fetchone()
     conn.close()
-    return dict(record) if record else None
+    return normalize_record_times(dict(record)) if record else None
 
 # ========== API 路由 ==========
 
@@ -1479,6 +1522,21 @@ async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     print(f"✅ 客户端已连接（student_id={student_id}）")
     current_student_id = student_id
+
+    # ===== P1-5：握手鉴权通过后只查一次数据库，取真实姓名缓存，帧循环内直接复用 =====
+    student_name = "学生" + str(student_id)
+    try:
+        student_info = get_student_by_id(student_id)
+        if student_info and student_info.get("name"):
+            student_name = student_info["name"]
+    except Exception as e:
+        # 查询失败时降级为默认显示名，且不影响监控主流程
+        print(f"⚠️ 获取学生姓名失败（student_id={student_id}）：{e}")
+
+    # 若该学生此前已有在线记录，同步刷新姓名，避免继续显示旧的占位名
+    if student_id in online_students:
+        online_students[student_id]["name"] = student_name
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -1490,19 +1548,6 @@ async def ws_endpoint(websocket: WebSocket):
                 
                 # 缓存学生视频帧（供教师实时查看）
                 if student_id and result.get("annotated_image"):
-                    # 查询学生姓名
-                    student_name = "学生" + str(student_id)
-                    try:
-                        conn = sqlite3.connect("users.db")
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT name FROM users WHERE id=?", (student_id,))
-                        row = cursor.fetchone()
-                        if row and row[0]:
-                            student_name = row[0]
-                        conn.close()
-                    except:
-                        pass
-                    
                     update_student_video_cache(
                         student_id,
                         result["annotated_image"],
@@ -1610,11 +1655,11 @@ async def delete_my_student_data(user: dict = Depends(get_current_user)):
     }
 
 if __name__ == "__main__":
-    # 初始化数据库
-    init_db()
+    # P1-6：建表、迁移与模型加载已统一由 lifespan 负责，此处不再重复调用 init_db()
+    # P1-8：启动主机与端口改为读取 config 中的 HOST / PORT（此前为硬编码，配置项形同虚设）
     print("=" * 50)
     print("🎓 AI学伴 · 专注度智能监护系统")
-    print("📍 访问地址: http://0.0.0.0:8001")
+    print(f"📍 访问地址: http://{HOST}:{PORT}")
     print("👤 学生: 注册后登录 → 进入专注度监控")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host=HOST, port=PORT)
