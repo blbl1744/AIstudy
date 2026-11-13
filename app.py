@@ -16,11 +16,17 @@ import time
 import math
 import os
 import sys
+import hmac
 import pickle
+import threading
+from collections import Counter
 import numpy as np
 import hashlib
 import secrets
 import sqlite3
+import bcrypt
+import jwt
+import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
 from fastapi.responses import FileResponse
@@ -376,22 +382,27 @@ def init_db():
         )
     ''')
 
-    # ===== 插入默认教师账号 =====
+    # ===== 管理员账号初始化（P0-4：不再内置 teacher / 123456 默认口令）=====
+    # 仅当环境变量 AI_STUDY_ADMIN_PASSWORD 非空、且库中不存在 teacher 账号时才创建
+    _admin_password = (os.getenv("AI_STUDY_ADMIN_PASSWORD") or "").strip()
     cursor.execute("SELECT COUNT(*) FROM teachers WHERE username = 'teacher'")
     if cursor.fetchone()[0] == 0:
-        cursor.execute(
-            "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
-            ("teacher", hash_password("123456"))
-        )
+        if _admin_password:
+            cursor.execute(
+                "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
+                ("teacher", hash_password(_admin_password))
+            )
+            print("✅ 已依据环境变量 AI_STUDY_ADMIN_PASSWORD 初始化管理员账号：teacher")
+        else:
+            print("ℹ️ 未配置环境变量 AI_STUDY_ADMIN_PASSWORD，跳过管理员账号初始化")
 
     conn.commit()
     conn.close()
-    print("✅ 数据库初始化完成（默认教师账号: teacher / 123456）")
+    print("✅ 数据库初始化完成")
 
 # ========== JWT 认证工具 ==========
 def create_jwt_token(user_id: int, role: str, username: str) -> str:
     """创建JWT令牌，包含角色信息"""
-    import jwt
     expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
     payload = {
         "sub": username,
@@ -404,13 +415,12 @@ def create_jwt_token(user_id: int, role: str, username: str) -> str:
 
 def verify_jwt_token(token: str) -> dict:
     """验证JWT令牌"""
-    import jwt
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token已过期")
-    except jwt.JWTError:
+    except jwt.InvalidTokenError:  # PyJWT 2.x：JWTError 已移除，改用 InvalidTokenError 基类
         raise HTTPException(status_code=401, detail="无效的Token")
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -418,9 +428,87 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     token = credentials.credentials
     return verify_jwt_token(token)
 
+# ========== 密码安全（P0-4） ==========
 def hash_password(password: str) -> str:
-    """密码哈希"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """生成密码哈希：bcrypt（随机盐，cost=12）"""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+def is_bcrypt_hash(hashed: str) -> bool:
+    """判断哈希是否为 bcrypt 格式（$2a$ / $2b$ / $2y$）"""
+    return isinstance(hashed, str) and hashed.startswith("$2")
+
+def verify_password(password: str, hashed: str) -> bool:
+    """校验密码：bcrypt 哈希用 bcrypt.checkpw；历史无盐 SHA256 哈希用常量时间比对"""
+    if not hashed:
+        return False
+    if is_bcrypt_hash(hashed):
+        try:
+            return bcrypt.checkpw((password or "").encode("utf-8"), hashed.encode("utf-8"))
+        except (ValueError, TypeError):
+            return False
+    # 兼容历史 64 位十六进制无盐 SHA256 哈希
+    legacy_hash = hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy_hash, hashed)
+
+def upgrade_password_hash(role: str, user_id: int, new_hash: str) -> None:
+    """将密码哈希原地升级（仅用于历史 SHA256 → bcrypt 的平滑迁移）"""
+    table = "students" if role == "student" else "teachers"
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE " + table + " SET password_hash = ? WHERE id = ?", (new_hash, user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ 密码哈希升级失败（{role}:{user_id}）：{e}")
+
+# ========== 登录失败限速（P0-4） ==========
+_LOGIN_MAX_FAILS = 5          # 连续失败次数上限
+_LOGIN_LOCK_SECONDS = 900     # 锁定时长：15 分钟
+_login_fail = {}              # 结构：{"role:username": {"count": int, "locked_until": float}}
+_login_fail_lock = threading.Lock()   # 保护 _login_fail 的模块级锁
+
+def _login_key(role: str, username: str) -> str:
+    """限速键：角色 + 用户名（统一小写、去空格，避免大小写绕过）"""
+    return f"{role}:{(username or '').strip().lower()}"
+
+def _raise_if_login_locked(role: str, username: str) -> None:
+    """锁定期内直接返回 429"""
+    key = _login_key(role, username)
+    now = time.time()
+    remain = 0
+    with _login_fail_lock:
+        record = _login_fail.get(key)
+        if not record:
+            return
+        locked_until = record.get("locked_until", 0)
+        if locked_until and locked_until > now:
+            remain = int(locked_until - now) + 1
+        elif locked_until:
+            # 锁定期已结束，重置记录
+            _login_fail.pop(key, None)
+            return
+        else:
+            return
+    raise HTTPException(status_code=429, detail=f"登录失败次数过多，请在 {remain} 秒后重试")
+
+def _record_login_failure(role: str, username: str) -> None:
+    """记录一次登录失败，达到上限则锁定"""
+    key = _login_key(role, username)
+    now = time.time()
+    with _login_fail_lock:
+        record = _login_fail.setdefault(key, {"count": 0, "locked_until": 0.0})
+        if record.get("locked_until") and record["locked_until"] <= now:
+            record["count"] = 0
+            record["locked_until"] = 0.0
+        record["count"] += 1
+        if record["count"] >= _LOGIN_MAX_FAILS:
+            record["locked_until"] = now + _LOGIN_LOCK_SECONDS
+
+def _clear_login_failures(role: str, username: str) -> None:
+    """登录成功后清零失败计数"""
+    with _login_fail_lock:
+        _login_fail.pop(_login_key(role, username), None)
 
 # ========== 数据模型 ==========
 class StudentRegisterRequest(BaseModel):
@@ -567,9 +655,20 @@ async def teacher_register(request: LoginRequest):
 # --- 学生登录 ---
 @app.post("/api/student/login")
 async def student_login(request: LoginRequest):
+    # P0-4：失败次数达到上限则直接拒绝（HTTP 429）
+    _raise_if_login_locked("student", request.username)
+
     student = get_student_by_username(request.username)
-    if not student or student["password_hash"] != hash_password(request.password):
+    if not student or not verify_password(request.password, student["password_hash"]):
+        _record_login_failure("student", request.username)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    # 登录成功：清零失败计数
+    _clear_login_failures("student", request.username)
+
+    # P0-4：历史 SHA256 哈希校验通过后，立即原地升级为 bcrypt
+    if not is_bcrypt_hash(student["password_hash"]):
+        upgrade_password_hash("student", student["id"], hash_password(request.password))
 
     token = create_jwt_token(student["id"], "student", request.username)
     return {
@@ -584,9 +683,20 @@ async def student_login(request: LoginRequest):
 # --- 教师登录 ---
 @app.post("/api/teacher/login")
 async def teacher_login(request: LoginRequest):
+    # P0-4：失败次数达到上限则直接拒绝（HTTP 429）
+    _raise_if_login_locked("teacher", request.username)
+
     teacher = get_teacher_by_username(request.username)
-    if not teacher or teacher["password_hash"] != hash_password(request.password):
+    if not teacher or not verify_password(request.password, teacher["password_hash"]):
+        _record_login_failure("teacher", request.username)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    # 登录成功：清零失败计数
+    _clear_login_failures("teacher", request.username)
+
+    # P0-4：历史 SHA256 哈希校验通过后，立即原地升级为 bcrypt
+    if not is_bcrypt_hash(teacher["password_hash"]):
+        upgrade_password_hash("teacher", teacher["id"], hash_password(request.password))
 
     token = create_jwt_token(teacher["id"], "teacher", request.username)
     return {
@@ -681,8 +791,6 @@ async def student_save_behavior(data: dict, user: dict = Depends(get_current_use
     return {"message": "行为数据已保存"}
 
 # ========== 火山引擎语音识别封装 ==========
-import requests
-
 class VolcEngineASR:
     def __init__(self, access_key, secret_key):
         self.access_key = access_key
@@ -1031,7 +1139,6 @@ class MediaPipePoseAnalyzer:
         """基于 Face Mesh 关键点计算 EAR（眼纵横比），闭眼时 EAR 接近 0"""
         if face_landmarks is None:
             return 0.3
-        import math
         def _ear(p1, p2, p3, p4, p5, p6):
             v1 = math.hypot(p2.x - p6.x, p2.y - p6.y)
             v2 = math.hypot(p3.x - p5.x, p3.y - p5.y)
@@ -1193,7 +1300,6 @@ class MediaPipePoseAnalyzer:
             return action
         # 取最近5帧的众数
         recent = self.action_history[-5:]
-        from collections import Counter
         most_common = Counter(recent).most_common(1)[0]
         return most_common[0]
 
@@ -1276,17 +1382,47 @@ def get_student_video_cache(student_id: int):
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    # ===== P0-1：握手阶段完成 Origin 校验与 JWT 鉴权，全部在 accept 之前 =====
+    origin = websocket.headers.get("origin")
+    if origin and "*" not in CORS_ALLOW_ORIGINS and origin not in CORS_ALLOW_ORIGINS:
+        # 4403：来源不在白名单
+        await websocket.close(code=4403)
+        return
+
+    token = websocket.query_params.get("token")
+    if not token:
+        # 4401：缺少令牌
+        await websocket.close(code=4401)
+        return
+
+    try:
+        payload = verify_jwt_token(token)
+    except HTTPException:
+        # 4401：令牌无效或已过期
+        await websocket.close(code=4401)
+        return
+
+    if payload.get("role") != "student":
+        # 4403：仅学生可建立分析连接
+        await websocket.close(code=4403)
+        return
+
+    # 身份只取自令牌，后续任何客户端消息都无法改变当前学生身份
+    student_id = payload.get("user_id")
+    if not student_id:
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
-    print("✅ 客户端已连接")
-    current_student_id = None
+    print(f"✅ 客户端已连接（student_id={student_id}）")
+    current_student_id = student_id
     try:
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
             if "image" in msg:
                 scene = msg.get("scene", "selfstudy")
-                student_id = msg.get("student_id")
-                current_student_id = student_id
+                # P0-1：身份已由令牌绑定，忽略消息体中的 student_id
                 result = analyzer.analyze(msg["image"], scene, student_id)
                 
                 # 缓存学生视频帧（供教师实时查看）
@@ -1339,40 +1475,42 @@ async def ws_endpoint(websocket: WebSocket):
 # ========== 前端页面（已抽离至 templates/index.html） ==========
 
 
-# 调试接口：查看所有缓存
-@app.get("/api/debug/cache")
-async def debug_cache():
-    """调试接口：查看所有学生视频缓存"""
-    result = {}
-    for sid, cache in student_video_cache.items():
-        result[sid] = {
-            "has_image": cache.get("image") is not None,
-            "image_length": len(cache.get("image", "")),
-            "timestamp": cache.get("timestamp"),
-            "name": cache.get("name"),
-            "focus_score": cache.get("focus_score")
+# 调试接口（P0-3）：默认不注册；仅当环境变量 AI_STUDY_DEBUG_API == "1" 时注册，且仅教师可访问
+if os.getenv("AI_STUDY_DEBUG_API") == "1":
+    @app.get("/api/debug/cache")
+    async def debug_cache(user: dict = Depends(get_current_user)):
+        """调试接口：查看所有学生视频缓存（需教师权限）"""
+        if user.get("role") != "teacher":
+            raise HTTPException(status_code=403, detail="仅教师可访问")
+        result = {}
+        for sid, cache in student_video_cache.items():
+            result[sid] = {
+                "has_image": cache.get("image") is not None,
+                "image_length": len(cache.get("image", "")),
+                "timestamp": cache.get("timestamp"),
+                "name": cache.get("name"),
+                "focus_score": cache.get("focus_score")
+            }
+        return {
+            "total_students": len(student_video_cache),
+            "caches": result
         }
-    return {
-        "total_students": len(student_video_cache),
-        "caches": result
-    }
 
 
 @app.get("/")
 async def root():
     return FileResponse(os.path.join(BASE_DIR, "templates", "index.html"))
 @app.get("/api/student/notifications")
-async def get_student_notifications(student_id: int):
-    """学生端：获取自己的提醒"""
-    try:
-        notification = student_notifications.get(student_id)
-        if notification:
-            # 获取后删除，避免重复提醒
-            del student_notifications[student_id]
-            return {"success": True, "notification": notification}
-        return {"success": True, "notification": None}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+async def get_student_notifications(user: dict = Depends(get_current_user)):
+    """学生端：获取自己的提醒（P0-2：身份只取自令牌，不再接受 student_id 参数）"""
+    if user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="仅学生可访问")
+    student_id = user.get("user_id")
+    # 原子读取并删除，避免并发重复提醒与 KeyError
+    notification = student_notifications.pop(student_id, None)
+    if notification:
+        return {"success": True, "notification": notification}
+    return {"success": True, "notification": None}
 
 if __name__ == "__main__":
     # 初始化数据库
@@ -1381,6 +1519,5 @@ if __name__ == "__main__":
     print("🎓 AI学伴 · 专注度智能监护系统")
     print("📍 访问地址: http://0.0.0.0:8001")  # 改成 0.0.0.0，方便你确认
     print("👤 学生: 注册后登录 → 进入专注度监控")
-    print("👨‍🏫 教师: teacher / 123456 → 查看学生列表")
     print("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=8001)

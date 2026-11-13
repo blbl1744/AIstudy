@@ -960,6 +960,10 @@
 
         // ========== 学生端：监控页面 ==========
         const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+        // P0-1：握手阶段需要鉴权，连接地址携带当前登录令牌
+        function buildWsUrl() {
+            return `${WS_URL}?token=${encodeURIComponent(currentToken || '')}`;
+        }
         let currentScene = 'selfstudy';
         let ws = null;
         let videoElement = null;
@@ -1010,7 +1014,10 @@
         async function checkNotifications() {
             if (!currentUser || !currentUser.student_id) return;
             try {
-                const resp = await fetch(`/api/student/notifications?student_id=${currentUser.student_id}`);
+                // P0-2：身份由服务端令牌识别，前端不再传 student_id
+                const resp = await fetch('/api/student/notifications', {
+                    headers: currentToken ? { 'Authorization': `Bearer ${currentToken}` } : {}
+                });
                 const data = await resp.json();
                 if (data.success && data.notification) {
                     const msg = data.notification.message;
@@ -1059,7 +1066,7 @@
         }
 
         function initWebSocket() {
-            ws = new WebSocket(WS_URL);
+            ws = new WebSocket(buildWsUrl());
             ws.onopen = () => {
                 document.getElementById('connectionDot').style.background = '#22c55e';
                 document.getElementById('connectionText').innerText = '已连接';
@@ -1069,8 +1076,13 @@
                 lastBehaviorData = data;
                 updateUI(data);
             };
-            ws.onclose = () => {
+            ws.onclose = (event) => {
                 document.getElementById('connectionDot').style.background = '#ef4444';
+                // P0-1：鉴权失败（4401 令牌无效 / 4403 来源或角色不允许）不再无限重连
+                if (event.code === 4401 || event.code === 4403) {
+                    document.getElementById('connectionText').innerText = '登录状态已失效，请重新登录';
+                    return;
+                }
                 document.getElementById('connectionText').innerText = '重连中...';
                 setTimeout(initWebSocket, 3000);
             };
@@ -1089,7 +1101,8 @@
             const ctx = canvas.getContext('2d');
             ctx.drawImage(videoElement, 0, 0);
             const base64 = canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
-            ws.send(JSON.stringify({ image: base64, scene: currentScene, student_id: currentUser?.student_id }));
+            // P0-1：身份由服务端按令牌绑定，消息体不再传 student_id
+            ws.send(JSON.stringify({ image: base64, scene: currentScene }));
         }
 
         // ========== 语音播报 ==========
