@@ -54,20 +54,100 @@ except ImportError:
     VOLC_ASR_ENDPOINT = "https://openspeech.bytedance.com/api/v1/auc/recognize"
     HOST = "0.0.0.0"
     PORT = 8001
-    HEAD_DOWN_THRESHOLD = 25
-    BODY_SWAY_LIMIT = 15
-    EYE_CLOSED_FRAMES = 10
-    DISTRACTION_INTERVAL = 5
-    WARNING_LEVELS = {"mild": 60, "moderate": 40, "severe": 20}
+    # ===== P1-8：以下默认值已逐项对齐「当前业务代码实际生效的运行值」=====
+    # 目的：接入配置项后判定阈值零漂移（原 fallback 中的 25/10/5/{"mild":60,"severe":20}
+    # 以及 POSE_CONFIG 的静态图模式、model_complexity=1 等，都是与真实运行行为不一致的陈旧值）
+    HEAD_DOWN_THRESHOLD = 0.15          # 明显低头阈值（头部下沉比，越小越严格）
+    BODY_SWAY_LIMIT = 15                # 身体摆动上限（×100 百分比刻度）
+    EYE_CLOSED_FRAMES = 60              # 确认闭眼所需连续帧数（约 2 秒 @30fps）
+    DISTRACTION_INTERVAL = 3            # 连续低专注帧数达到该值计一次分心
+    WARNING_LEVELS = {"excellent": 80, "mild": 60, "moderate": 40}   # 建议语分档；低于 moderate 即 severe
     ASR_CONFIG = {"language": "zh-CN", "sample_rate": 16000, "silence_timeout": 120, "enable_volcengine": True, "enable_browser_asr": True}
     TTS_CONFIG = {"enabled": True, "language": "zh-CN", "rate": 0.9, "pitch": 1.1, "volume": 0.8, "cooldown": 30}
-    POSE_CONFIG = {"static_image_mode": True, "model_complexity": 1, "min_detection_confidence": 0.5, "min_tracking_confidence": 0.5}
-    POSE_THRESHOLDS = {"head_tilt_minor": 10, "head_tilt_major": 20, "head_drop_minor": 0.6, "head_drop_major": 0.3, "body_sway_minor": 8, "body_sway_major": 15, "shoulder_level_minor": 0.08, "shoulder_level_major": 0.15, "consecutive_low_focus": 3}
+    POSE_CONFIG = {"static_image_mode": False, "model_complexity": 2, "min_detection_confidence": 0.4, "min_tracking_confidence": 0.3}
+    POSE_THRESHOLDS = {
+        "head_tilt_minor": 10, "head_tilt_major": 20,
+        "head_drop_minor": 0.35, "head_drop_major": 0.15,
+        "body_sway_minor": 8, "body_sway_major": 15,
+        "shoulder_level_minor": 0.08, "shoulder_level_major": 0.15,
+        "iris_offset_minor": 0.12, "iris_offset_major": 0.25,
+        # EAR（眼纵横比）分档：与 _evaluate_fatigue 实际生效值一致
+        "ear_fatigue_major": 0.22, "ear_fatigue_minor": 0.30,
+        # EAR 缺省值（人脸关键点缺失时的中性假想值）与闭眼帧衰减步长
+        "ear_default": 0.3, "eyes_closed_decay": 2,
+        # 关键点坐标为 0-1 归一化值，转成百分制时需要乘以该系数（纯单位换算）
+        "coord_scale": 100.0, "shoulder_width_eps": 0.01,
+        "consecutive_low_focus": 3, "distraction_score_threshold": 60,
+    }
     # P0-5：此处不再内置任何可用密钥，留空后交由下方「安全配置加固」段处理
     # （优先读取环境变量 AI_STUDY_JWT_SECRET，未配置则生成进程内随机密钥）
     JWT_SECRET_KEY = ""
     JWT_ALGORITHM = "HS256"
     JWT_EXPIRE_DAYS = 7
+
+# ========== P1-8：配置归一化（唯一真源原则） ==========
+# 说明：旧的四个标量配置项与 POSE_THRESHOLDS 存在语义重叠，这里统一以标量配置为准回灌到阈值字典，
+# 保证「无论配置来自 config.py 还是 fallback，判定阈值只有一份来源」，避免同名阈值两处各说各话。
+POSE_THRESHOLDS["head_drop_major"] = HEAD_DOWN_THRESHOLD      # 明显低头
+POSE_THRESHOLDS["body_sway_major"] = BODY_SWAY_LIMIT          # 明显晃动
+POSE_THRESHOLDS["consecutive_low_focus"] = DISTRACTION_INTERVAL
+
+# ========== P1-8：分心扣分表集中（原散落在 _calculate_focus_score 中的魔法数字） ==========
+# 全部数值均等于重构前代码中的硬编码字面量，接入后评分行为零漂移。
+SCORE_PENALTIES = {
+    "head_pose_major": 20,            # 头部明显偏移
+    "head_pose_minor": 10,            # 头部轻微偏移
+    "head_down_major": 8,             # 明显低头
+    "head_down_minor": 4,             # 轻微低头
+    "body_major": 12,                 # 明显晃动
+    "body_minor": 5,                  # 轻微晃动
+    "fatigue_major": 15,              # 明显疲劳
+    "fatigue_minor": 8,               # 轻度疲劳
+    "eye_closed": 30,                 # 闭眼/走神
+    "eye_blur": 18,                   # 视线模糊
+    "eye_deviation_frequent": 12,     # 视线频繁偏离
+    "eye_deviation_occasional": 3,    # 视线偶尔偏离（正常眨眼级）
+    "stability_bonus": 4,             # 姿态高度稳定加分
+    "stability_penalty": 3,           # 姿态极不稳定扣分
+    "stability_high": 0.85,           # 触发加分的稳定性门槛
+    "stability_low": 0.2,             # 触发扣分的稳定性门槛
+    "scene_onetoone_bonus": 3,        # 一对一场景加严放宽
+    "scene_online_penalty": 3,        # 线上场景加严
+    "score_min": 10,                  # 分数下限
+    "score_max": 100,                 # 分数上限
+}
+
+# ========== P1-8：动作小分类几何阈值集中（原散落在 _classify_action 中的魔法数字） ==========
+# 数值与重构前完全一致，行为零漂移。
+ACTION_THRESHOLDS = {
+    "sleep_head_drop_ratio": 0.15,        # 鼻子低于肩线的比例 → 判睡觉
+    "sleep_head_drop_ratio_loose": 0.08,  # 更宽松的低头比例（需同时明显疲劳）
+    "wrist_torso_above_shoulder": 0.15,   # 手腕允许高于肩线的距离
+    "wrist_torso_below_hip": 0.05,        # 手腕允许低于髋线的距离
+    "wrist_center_ratio": 0.8,            # 手腕距中线小于肩宽的该比例视为靠近身体中心
+    "elbow_bend_dy": 0.15,                # 手腕与肘部 y 差值小于该值视为肘部弯曲
+    "action_history_size": 8,             # 动作历史窗口
+    "action_vote_window": 5,              # 众数投票窗口
+    "action_vote_min": 3,                 # 触发投票的最小历史帧数
+}
+
+# ========== P1-8：分数时序平滑参数集中（原散落在 _smooth_focus_score 中的魔法数字） ==========
+SCORE_SMOOTHING = {
+    "history_size": 15,      # 平滑历史窗口
+    "min_history": 3,        # 触发平滑的最小历史帧数
+    "decay": 0.9,            # 指数平滑衰减系数
+    "inertia_window": 5,     # 惯性判断窗口
+    "inertia_gap": 8,        # 与近期均值差距小于该值才施加惯性
+    "inertia_blend": 0.7,    # 惯性混合权重（平滑值占比，其余为近期均值）
+}
+
+# ========== P1-8：姿态稳定性（时序方差）参数集中 ==========
+POSE_STABILITY = {
+    "history_size": 10,          # 历史窗口
+    "min_history": 3,            # 触发计算的最小历史帧数
+    "tilt_var_scale": 100.0,     # 头部水平偏移方差归一系数
+    "shoulder_var_scale": 10.0,  # 肩高差方差归一系数
+}
 
 # ========== 安全配置加固（P0-5 / P0-6） ==========
 # P0-5 JWT 密钥：不再使用硬编码兜底密钥，改为「环境变量优先 + 缺失时进程内随机生成」。
@@ -130,12 +210,8 @@ app.add_middleware(
 # ========== MediaPipe 初始化 ==========
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=2,
-    min_detection_confidence=0.4,
-    min_tracking_confidence=0.3
-)
+# P1-8：姿态推理参数不再硬编码，统一由 POSE_CONFIG 提供（默认值已对齐历史实际运行值）
+pose = mp_pose.Pose(**POSE_CONFIG)
 
 # ========== 新增：Face Mesh 初始化 ==========
 mp_face_mesh = mp.solutions.face_mesh
@@ -149,11 +225,41 @@ face_mesh = mp_face_mesh.FaceMesh(
 
 # ========== 模型加载（全局缓存，只加载一次）==========
 # P0-7：模型反序列化加固 —— 彻底移除不安全的反序列化调用，改用 joblib；且必须通过 SHA256 白名单校验
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "focus_model.pkl")
+# P1-1：模型目录真实名称为 model/（历史代码误写为 models/），并支持环境变量覆盖
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
+MODEL_PATH = (os.getenv("AI_STUDY_MODEL_PATH") or "").strip() or os.path.join(MODEL_DIR, "focus_model.pkl")
 MODEL_SHA256_ENV = "AI_STUDY_MODEL_SHA256"   # 模型文件 SHA256 白名单（环境变量）
+MODEL_ENABLE_ENV = "AI_STUDY_ENABLE_MODEL"   # 模型推理开关（默认 "0"：纯规则引擎）
+
+# ========== P1-2：13 维特征契约 ==========
+# 说明：仓库历史上同时存在两套特征口径 —— MediaPipePoseAnalyzer 内的 51 维（17 点 × 3 坐标）
+# 与模块级 extract_pose_features 的 13 维。本地训练模型 n_features_in_ = 13，
+# 故此处以 13 维为唯一契约，并把该几何定义提为唯一实现（extract_model_features），51 维口径彻底移除。
+FEATURE_VERSION = "pose13-v1"
+FEATURE_DIM = 13
+# 特征顺序（每个位置的语义，改动顺序必须同步升 FEATURE_VERSION）
+FEATURE_LAYOUT = (
+    "head_tilt",            # 0  双耳连线倾角（弧度）
+    "head_dx", "head_dy", "head_dz",   # 1-3 鼻子相对肩中心的偏移量
+    "eye_distance",         # 4  双眼间距
+    "shoulder_level",       # 5  双肩高度差
+    "body_angle",           # 6  双肩连线倾角（弧度）
+    "head_shoulder_dist",   # 7  头-肩中心距离
+    "eye_shoulder_dist",    # 8  眼中心-肩中心距离
+    "hip_cx", "hip_cy", "hip_cz",      # 9-11 髋中心坐标（躯干基准点）
+    "body_lean",            # 12 肩中心与髋中心的深度差（前倾/后仰）
+)
+# 参与计算的 MediaPipe 关键点索引（33 点姿态模型下标）
+FEATURE_LANDMARK_INDICES = (0, 2, 5, 7, 8, 11, 12, 23, 24)
+
+# ========== P1-4：模型置信度门限 ==========
+# 模型置信度低于该值时不对外输出模型判断，只保留规则引擎结论，避免低质量推理污染展示
+MODEL_MIN_CONFIDENCE = 0.65
+
 _cached_model = None
-_cached_scaler = None
 _cached_model_loaded = False
+# P1-3：仅在模型文件是 {"model":..., "scaler":..., "feature_version":...} 字典包时才会有值
+_cached_scaler = None
 
 
 def _verify_model_sha256(path: str, expected_sha256: str) -> None:
@@ -173,159 +279,202 @@ def _verify_model_sha256(path: str, expected_sha256: str) -> None:
         raise RuntimeError("模型文件 SHA256 校验失败，拒绝加载")
 
 
-def load_trained_model():
-    """加载训练好的模型（全局缓存）
+def extract_model_features(landmarks):
+    """从 MediaPipe 33 点姿态关键点提取 13 维模型特征（唯一实现）
 
-    P0-7：
-    - 模型文件不存在 → 记录警告日志并安全降级为规则模式，返回 None；
-    - 模型文件存在 → 必须配置 AI_STUDY_MODEL_SHA256 且校验通过，才允许 joblib.load。
+    - 输入：results.pose_landmarks.landmark（长度 33）
+    - 输出：np.ndarray，形状恒为 (FEATURE_DIM,)，与 FEATURE_LAYOUT 顺序严格对应
+    - 返回 None 表示提取失败（关键点缺失/数值异常）
     """
-    global _cached_model, _cached_model_loaded
+    try:
+        if landmarks is None or len(landmarks) < 33:
+            raise ValueError(f"关键点数量不足：{0 if landmarks is None else len(landmarks)} < 33")
+
+        def _lm(idx):
+            lm = landmarks[idx]
+            return np.array([float(lm.x), float(lm.y), float(lm.z)], dtype=np.float64)
+
+        nose = _lm(0)
+        left_eye, right_eye = _lm(2), _lm(5)
+        left_ear, right_ear = _lm(7), _lm(8)
+        left_shoulder, right_shoulder = _lm(11), _lm(12)
+        left_hip, right_hip = _lm(23), _lm(24)
+
+        shoulder_center = (left_shoulder + right_shoulder) / 2.0
+        eye_center = (left_eye + right_eye) / 2.0
+        hip_center = (left_hip + right_hip) / 2.0
+        head_relative = nose - shoulder_center
+
+        features = [
+            float(np.arctan2(right_ear[1] - left_ear[1], right_ear[0] - left_ear[0])),   # head_tilt
+            float(head_relative[0]), float(head_relative[1]), float(head_relative[2]),   # head_dx/dy/dz
+            float(np.linalg.norm(left_eye - right_eye)),                                 # eye_distance
+            float(abs(left_shoulder[1] - right_shoulder[1])),                            # shoulder_level
+            float(np.arctan2(right_shoulder[1] - left_shoulder[1],
+                             right_shoulder[0] - left_shoulder[0])),                     # body_angle
+            float(np.linalg.norm(nose - shoulder_center)),                               # head_shoulder_dist
+            float(np.linalg.norm(eye_center - shoulder_center)),                         # eye_shoulder_dist
+            float(hip_center[0]), float(hip_center[1]), float(hip_center[2]),            # hip_cx/cy/cz
+            float(shoulder_center[2] - hip_center[2]),                                   # body_lean
+        ]
+        arr = np.asarray(features, dtype=np.float64)
+        if arr.shape != (FEATURE_DIM,):
+            raise ValueError(f"特征维度异常：{arr.shape}，契约要求 ({FEATURE_DIM},)")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("特征包含非有限值（NaN/Inf）")
+        return arr
+    except Exception as e:
+        print(f"⚠️ 模型特征提取失败: {e}")
+        return None
+
+
+def assert_model_contract(model):
+    """P1-2：启动期特征契约自检
+
+    校验模型声明的输入维度与代码 FEATURE_DIM 完全一致；不一致直接抛 RuntimeError，
+    绝不允许「加载成功、运行时才对不上」的静默失败。
+    """
+    n_features = getattr(model, "n_features_in_", None)
+    if n_features is None:
+        raise RuntimeError(
+            f"模型契约校验失败：加载对象（{type(model).__name__}）缺少 n_features_in_，"
+            f"无法确认其输入维度，代码当前契约 {FEATURE_VERSION}={FEATURE_DIM} 维"
+        )
+    if int(n_features) != FEATURE_DIM:
+        raise RuntimeError(
+            f"模型契约校验失败：模型期望 {int(n_features)} 维特征，代码当前输出 {FEATURE_DIM} 维"
+            f"（{FEATURE_VERSION}），二者不一致，拒绝启用模型推理"
+        )
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None and len(names) != FEATURE_DIM:
+        raise RuntimeError(
+            f"模型契约校验失败：feature_names_in_ 长度 {len(names)} 与契约 {FEATURE_DIM} 维不一致"
+        )
+    return True
+
+
+def load_trained_model():
+    """加载训练好的模型（全局缓存，进程内只尝试一次）
+
+    P1-1：默认「纯规则引擎模式」，只有显式设置 AI_STUDY_ENABLE_MODEL=1 才尝试加载，
+          避免本地存在模型文件却未配哈希时阻塞启动。
+    P0-7：启用模型后必须通过 AI_STUDY_MODEL_SHA256 校验，才允许 joblib.load。
+    P1-2：加载后立即执行 assert_model_contract 维度自检。
+    P1-3：兼容 {"model": clf, "scaler": sc, "feature_version": ...} 字典包。
+    """
+    global _cached_model, _cached_scaler, _cached_model_loaded
     if _cached_model_loaded:
         return _cached_model
-    _cached_model_loaded = True  # 标记已尝试过，避免重复尝试
 
-    if not os.path.exists(MODEL_PATH):
-        print(f"⚠️ 未找到模型文件，降级为规则引擎模式: {MODEL_PATH}")
+    # 开关关闭：直接进入纯规则引擎模式（不读文件、不校验哈希、不抛错）
+    if (os.getenv(MODEL_ENABLE_ENV) or "0").strip() != "1":
+        _cached_model_loaded = True   # 纯规则模式为稳定状态，可安全缓存
+        print(f"ℹ️ 当前处于纯规则引擎模式（未启用模型推理）：如需启用请设置 {MODEL_ENABLE_ENV}=1")
         return None
+
+    # 开关打开：模型文件、哈希、契约三者缺一不可，任何一步失败都直接抛错
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(f"已开启模型推理（{MODEL_ENABLE_ENV}=1）但未找到模型文件: {MODEL_PATH}")
 
     expected_sha256 = (os.getenv(MODEL_SHA256_ENV) or "").strip()
     if not expected_sha256:
         raise RuntimeError(f"未配置环境变量 {MODEL_SHA256_ENV}，拒绝加载模型文件")
 
     _verify_model_sha256(MODEL_PATH, expected_sha256)   # 校验失败直接抛错，不降级
+
     try:
-        _cached_model = joblib.load(MODEL_PATH)
+        loaded = joblib.load(MODEL_PATH)
     except Exception as e:
         raise RuntimeError(f"模型文件加载失败，拒绝启用模型: {e}")
-    print(f"✅ 专注度模型已通过 SHA256 校验并加载: {MODEL_PATH}")
+
+    # P1-3：字典包解包（训练管线带标准化器时使用）
+    if isinstance(loaded, dict):
+        bundle_version = loaded.get("feature_version")
+        if bundle_version != FEATURE_VERSION:
+            raise RuntimeError(
+                f"模型包特征版本不匹配：文件为 {bundle_version!r}，代码期望 {FEATURE_VERSION!r}"
+                f"（{FEATURE_DIM} 维），拒绝启用"
+            )
+        model = loaded.get("model")
+        if model is None:
+            raise RuntimeError("模型包格式非法：缺少 model 字段")
+        scaler = loaded.get("scaler")
+    else:
+        model = loaded
+        scaler = None
+
+    assert_model_contract(model)   # P1-2：维度不符直接 RuntimeError
+
+    _cached_model = model
+    _cached_scaler = scaler
+    _cached_model_loaded = True    # 仅在完全加载成功后置位，避免失败被缓存成「静默降级」
+    print(f"✅ 专注度模型已通过 SHA256 校验并加载: {MODEL_PATH} "
+          f"(特征维度={FEATURE_DIM}, 版本={FEATURE_VERSION}, 标准化={'是' if scaler is not None else '否'})")
     return _cached_model
 
+
 def predict_focus(features):
-    """预测专注度 - 支持标准化"""
+    """模型推理（P1-4：保留 predict_proba 原始概率语义，不做任何区间重映射）
+
+    返回 (结果字典, prob_focused)；模型不可用或推理失败返回 (None, 0.0)。
+    """
     global _cached_model, _cached_scaler
     if _cached_model is None:
-        return None, 0.5
+        return None, 0.0
     try:
-        features = features.reshape(1, -1)
+        arr = np.asarray(features, dtype=np.float64).reshape(1, -1)
+        if arr.shape[1] != FEATURE_DIM:
+            raise ValueError(f"特征维度不匹配：输入 {arr.shape[1]} 维，契约要求 {FEATURE_DIM} 维（{FEATURE_VERSION}）")
         if _cached_scaler is not None:
-            features = _cached_scaler.transform(features)
-        proba = _cached_model.predict_proba(features)[0] if hasattr(_cached_model, 'predict_proba') else [0.5, 0.5]
-        raw_focused_prob = round(float(proba[1]), 4)
-        # 模型概率映射：将原始概率映射到更合理的范围
-        # 原始范围 [0, 1] → 映射到 [0.35, 0.98]，使专注时模型分能达到95+
-        focused_prob = min(0.98, max(0.15, 0.35 + raw_focused_prob * 0.63))
-        distracted_prob = 1.0 - focused_prob
+            arr = _cached_scaler.transform(arr)
+        if not hasattr(_cached_model, "predict_proba"):
+            print("⚠️ 模型推理失败: 当前模型不支持 predict_proba")
+            return None, 0.0
+        proba = _cached_model.predict_proba(arr)[0]
+        # 类别顺序约定为 [分心, 专注]（与训练脚本 classes_ 一致）；若模型自带 classes_ 则以其为准，
+        # 避免类别顺序变化导致概率语义被静默颠倒。
+        classes = getattr(_cached_model, "classes_", None)
+        focused_idx = 1
+        if classes is not None:
+            cls_list = list(classes)
+            if 1 in cls_list:
+                focused_idx = cls_list.index(1)
+            elif len(cls_list) != 2:
+                raise ValueError(f"模型类别数异常：{cls_list}，期望二分类 [0, 1]")
+        prob_focused = round(float(proba[focused_idx]), 4)
+        prob_distracted = round(1.0 - prob_focused, 4)
         return {
-            "is_focused": focused_prob > 0.5,
-            "confidence": focused_prob if focused_prob > 0.5 else distracted_prob,
-            "label": "专注" if focused_prob > 0.5 else "分心",
-            "prob_focused": focused_prob,
-            "prob_distracted": distracted_prob
-        }, focused_prob
+            "is_focused": prob_focused > 0.5,
+            "confidence": round(max(prob_focused, prob_distracted), 4),
+            "label": "专注" if prob_focused > 0.5 else "分心",
+            "prob_focused": prob_focused,
+            "prob_distracted": prob_distracted,
+        }, prob_focused
     except Exception as e:
-        print(f"WARNING: model predict error: {e}")
-        return None, 0.5
+        print(f"⚠️ 模型推理失败: {e}")
+        return None, 0.0
+
 
 def extract_pose_features(image_path):
-    """从图片中提取姿态特征用于模型预测"""
+    """从图片文件中提取 13 维姿态特征（P1-2：统一委托给 extract_model_features）"""
     try:
         frame = cv2.imread(image_path)
         if frame is None:
             return None
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb_frame)
-        if not results.pose_landmarks:
-            return None
-        landmarks = results.pose_landmarks.landmark
-
-        def get_landmark(idx):
-            lm = landmarks[idx]
-            return np.array([lm.x, lm.y, lm.z])
-
-        nose = get_landmark(0)
-        left_eye = get_landmark(2)
-        right_eye = get_landmark(5)
-        left_shoulder = get_landmark(11)
-        right_shoulder = get_landmark(12)
-        left_ear = get_landmark(7)
-        right_ear = get_landmark(8)
-        left_hip = get_landmark(23)
-        right_hip = get_landmark(24)
-
-        features = []
-        head_tilt = np.arctan2(right_ear[1] - left_ear[1], right_ear[0] - left_ear[0])
-        features.append(head_tilt)
-        shoulder_center = (left_shoulder + right_shoulder) / 2
-        head_relative = nose - shoulder_center
-        features.extend(head_relative.tolist())
-        eye_distance = np.linalg.norm(left_eye - right_eye)
-        features.append(eye_distance)
-        shoulder_level = abs(left_shoulder[1] - right_shoulder[1])
-        features.append(shoulder_level)
-        body_angle = np.arctan2(right_shoulder[1] - left_shoulder[1],
-                                right_shoulder[0] - left_shoulder[0])
-        features.append(body_angle)
-        head_shoulder_dist = np.linalg.norm(nose - shoulder_center)
-        features.append(head_shoulder_dist)
-        eye_center = (left_eye + right_eye) / 2
-        eye_shoulder_dist = np.linalg.norm(eye_center - shoulder_center)
-        features.append(eye_shoulder_dist)
-        hip_center = (left_hip + right_hip) / 2
-        features.extend(hip_center.tolist())
-        body_lean = shoulder_center[2] - hip_center[2]
-        features.append(body_lean)
-        return np.array(features)
+        return extract_pose_features_from_frame(frame)
     except Exception as e:
         print(f"⚠️ 特征提取失败: {e}")
         return None
 
+
 def extract_pose_features_from_frame(frame):
-    """从内存中的视频帧直接提取姿态特征（避免磁盘IO）"""
+    """从内存中的视频帧提取 13 维姿态特征（避免磁盘 IO）"""
     try:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(rgb_frame)
         if not results.pose_landmarks:
             return None
-        landmarks = results.pose_landmarks.landmark
-
-        def get_landmark(idx):
-            lm = landmarks[idx]
-            return np.array([lm.x, lm.y, lm.z])
-
-        nose = get_landmark(0)
-        left_eye = get_landmark(2)
-        right_eye = get_landmark(5)
-        left_shoulder = get_landmark(11)
-        right_shoulder = get_landmark(12)
-        left_ear = get_landmark(7)
-        right_ear = get_landmark(8)
-        left_hip = get_landmark(23)
-        right_hip = get_landmark(24)
-
-        features = []
-        head_tilt = np.arctan2(right_ear[1] - left_ear[1], right_ear[0] - left_ear[0])
-        features.append(head_tilt)
-        shoulder_center = (left_shoulder + right_shoulder) / 2
-        head_relative = nose - shoulder_center
-        features.extend(head_relative.tolist())
-        eye_distance = np.linalg.norm(left_eye - right_eye)
-        features.append(eye_distance)
-        shoulder_level = abs(left_shoulder[1] - right_shoulder[1])
-        features.append(shoulder_level)
-        body_angle = np.arctan2(right_shoulder[1] - left_shoulder[1],
-                                right_shoulder[0] - left_shoulder[0])
-        features.append(body_angle)
-        head_shoulder_dist = np.linalg.norm(nose - shoulder_center)
-        features.append(head_shoulder_dist)
-        eye_center = (left_eye + right_eye) / 2
-        eye_shoulder_dist = np.linalg.norm(eye_center - shoulder_center)
-        features.append(eye_shoulder_dist)
-        hip_center = (left_hip + right_hip) / 2
-        features.extend(hip_center.tolist())
-        body_lean = shoulder_center[2] - hip_center[2]
-        features.append(body_lean)
-        return np.array(features)
+        return extract_model_features(results.pose_landmarks.landmark)
     except Exception as e:
         print(f"⚠️ 内存特征提取失败: {e}")
         return None
@@ -960,7 +1109,7 @@ class MediaPipePoseAnalyzer:
         self.action_history = []
         # 闭眼/疲劳持续时间计数（避免眨眼误检）
         self.eyes_closed_frames = 0
-        self.eyes_closed_threshold = 60  # 约2秒（假设30fps）
+        self.eyes_closed_threshold = EYE_CLOSED_FRAMES   # P1-8：接入配置项（默认 60 帧 ≈ 2 秒 @30fps）
         self.confirmed_eyes_closed = False
 
         self.check_model_status()
@@ -971,28 +1120,17 @@ class MediaPipePoseAnalyzer:
             model = load_trained_model()
             self.model_loaded = model is not None
             if self.model_loaded:
-                self.model_n_features = getattr(model, 'n_features_in_', 12)
+                self.model_n_features = int(getattr(model, 'n_features_in_', FEATURE_DIM))
                 print(f"✅ 专注度模型已加载 (特征维度={self.model_n_features})")
             else:
-                print("⚠️ 专注度预测模型未训练，将使用规则-based分析")
+                print("ℹ️ 专注度预测模型未启用，当前使用纯规则引擎分析")
         except Exception as e:
             print(f"⚠️ 模型检查失败: {e}")
             self.model_loaded = False
 
-    # MediaPipe 上半身关键点索引（用于特征提取）
-    UPPER_BODY_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-
     def _extract_model_features(self, landmarks):
-        """从已检测的 landmarks 中提取上半身关键点特征（51维）"""
-        try:
-            features = []
-            for idx in self.UPPER_BODY_INDICES:
-                lm = landmarks[idx]
-                features.extend([lm.x, lm.y, lm.z])
-            return np.array(features)
-        except Exception as e:
-            print(f"⚠️ 特征提取失败: {e}")
-            return None
+        """P1-2：51 维口径已废弃，统一委托给 13 维契约实现 extract_model_features"""
+        return extract_model_features(landmarks)
 
     def analyze(self, image_base64, scene="selfstudy", student_id=None):
         try:
@@ -1037,7 +1175,7 @@ class MediaPipePoseAnalyzer:
                 if is_eyes_closed_now:
                     self.eyes_closed_frames += 1
                 else:
-                    self.eyes_closed_frames = max(0, self.eyes_closed_frames - 2)
+                    self.eyes_closed_frames = max(0, self.eyes_closed_frames - POSE_THRESHOLDS["eyes_closed_decay"])
                 # 只有持续闭眼超过阈值才确认闭眼
                 if self.eyes_closed_frames >= self.eyes_closed_threshold:
                     self.confirmed_eyes_closed = True
@@ -1053,59 +1191,40 @@ class MediaPipePoseAnalyzer:
                 else:
                     # 第2优先级：眼睛睁开时，用虹膜偏移判断视线
                     iris_offset = self._calc_iris_offset(face_lm)
-                    if iris_offset > 0.25:
+                    if iris_offset > POSE_THRESHOLDS["iris_offset_major"]:
                         eye_focus_status = "频繁偏离"
-                    elif iris_offset > 0.12:
+                    elif iris_offset > POSE_THRESHOLDS["iris_offset_minor"]:
                         eye_focus_status = "偶尔偏离"
                     else:
                         eye_focus_status = "注视屏幕"
             else:
-                # Face Mesh 没检测到人脸（可能完全闭眼 / 眼镜反光），给保守默认值
-                fatigue_status = "轻度疲劳"
-                eye_focus_status = "视线模糊"
+                # P3-2：Face Mesh 未检测到人脸（短暂转头 / 眼镜反光 / 完全闭眼等）
+                # 历史实现对这种情况赋「轻度疲劳 + 视线模糊」，导致固定扣 26 分并被误判为分心。
+                # 现改为中性标记「未检测」，疲劳与眼神两项均不参与扣分，由姿态类指标独立判定。
+                fatigue_status = "未检测"
+                eye_focus_status = "未检测"
 
             # 姿态稳定性（辅助指标）
             pose_stability = self._calculate_pose_stability(head_tilt, shoulder_level)
 
-            # ========== 使用训练模型进行预测 ==========
-            model_prediction = None
+            # ========== P1-4：透明双轨输出（规则分独立可解释，模型结论单独呈现） ==========
+            # 规则分永远是最终 focus_score 的唯一来源，模型只作为辅助轨道输出，不再做任何权重混合。
+            rule_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
+            focus_score = rule_score
+
+            model_meta = None          # 高置信度时才填充，供接口返回
+            model_prediction = None    # 兼容旧字段：模型原始结果字典
+            score_source = "rule"
             if self.model_loaded:
-                try:
-                    features = self._extract_model_features(landmarks)
-                    if features is not None:
-                        model_result, focused_prob = predict_focus(features)
-                        model_prediction = model_result
-                        if model_result is not None:
-                            model_score = int(focused_prob * 100)
-                            rule_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
-                            # 智能融合：当模型分与规则分差距过大时，以规则分为主
-                            # 模型分持续<30说明模型未正确训练，应信任规则分
-                            score_diff = abs(model_score - rule_score)
-                            if rule_score > 90:
-                                # 规则分很高时，大幅降低模型影响，确保最终分95+
-                                focus_score = int(0.08 * model_score + 0.92 * rule_score)
-                            elif model_score < 30 and rule_score > 70:
-                                # 模型明显异常，几乎完全信任规则
-                                focus_score = int(0.05 * model_score + 0.95 * rule_score)
-                            elif score_diff > 40:
-                                # 分歧较大，提高规则权重
-                                focus_score = int(0.15 * model_score + 0.85 * rule_score)
-                            else:
-                                # 正常融合
-                                focus_score = int(0.25 * model_score + 0.75 * rule_score)
-                            print(f"📊 模型分={model_score} 规则分={rule_score} 最终={focus_score} 姿态={head_pose_status} 眼神={eye_focus_status} 疲劳={fatigue_status}")
-                        else:
-                            focus_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
-                    else:
-                        focus_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
-                except Exception as e:
-                    print(f"⚠️ 模型预测失败: {e}")
-                    focus_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
-            else:
-                # 未训练模型，使用传统规则
-                rule_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
-                focus_score = rule_score
-                print(f"📊 规则分={rule_score} (模型失效已忽略) 最终={focus_score} 姿态={head_pose_status} 眼神={eye_focus_status} 疲劳={fatigue_status}")
+                features = self._extract_model_features(landmarks)
+                if features is not None:
+                    model_prediction, model_conf = predict_focus(features)
+                    if model_prediction is not None and model_conf >= MODEL_MIN_CONFIDENCE:
+                        model_meta = model_prediction
+                        score_source = "rule+model"
+                    elif model_prediction is not None:
+                        print(f"ℹ️ 模型置信度 {model_conf:.2f} 低于门限 {MODEL_MIN_CONFIDENCE}，本次仅采用规则结论")
+            print(f"📊 规则分={rule_score} 最终={focus_score} 来源={score_source} 姿态={head_pose_status} 眼神={eye_focus_status} 疲劳={fatigue_status}")
 
             # ========== 时序平滑 ==========
             focus_score = self._smooth_focus_score(focus_score)
@@ -1113,7 +1232,7 @@ class MediaPipePoseAnalyzer:
             # ========== 保存有效分数（供fallback使用）==========
             self.last_valid_score = focus_score
 
-            is_distracted = focus_score < 60
+            is_distracted = focus_score < POSE_THRESHOLDS["distraction_score_threshold"]
             if is_distracted:
                 self.consecutive_low_focus += 1
                 if self.consecutive_low_focus >= POSE_THRESHOLDS.get("consecutive_low_focus", 3):
@@ -1142,10 +1261,11 @@ class MediaPipePoseAnalyzer:
             if action_label != "focused":
                 print(f"🏷️ 动作分类: {action_cn} ({action_label})")
 
-            # 构建模型预测信息
+            # P1-4：构建模型分轨信息（仅高置信度时才有内容，便于前端透明展示）
             model_info = ""
-            if model_prediction:
-                model_info = f"模型预测: {model_prediction.get('label', '未知')} (专注概率: {model_prediction.get('prob_focused', 0.5):.0%})"
+            if model_meta:
+                model_info = (f"模型预测: {model_meta.get('label', '未知')} "
+                              f"(专注概率: {model_meta.get('prob_focused', 0.0):.0%}, 置信度: {model_meta.get('confidence', 0.0):.0%})")
 
             return {
                 "focus_score": focus_score,
@@ -1160,6 +1280,11 @@ class MediaPipePoseAnalyzer:
                 "annotated_image": annotated_b64,
                 "model_prediction": model_info,
                 "model_enabled": self.model_loaded,
+                # P1-4：透明双轨字段
+                "model_available": model_meta is not None,
+                "model": model_meta,
+                "score_source": score_source,
+                "rule_score": rule_score,
                 "pose_stability": round(pose_stability, 2)
             }
         except Exception as e:
@@ -1209,23 +1334,25 @@ class MediaPipePoseAnalyzer:
         return annotated
 
     def _calc_head_tilt(self, n, ls, rs):
-        """计算头部水平偏移：鼻子相对肩膀中心的水平偏差"""
+        """计算头部水平偏移：鼻子相对肩膀中心的水平偏差（乘坐标比例系数转为百分制）"""
         shoulder_center_x = (ls.x + rs.x) / 2
-        return abs(n.x - shoulder_center_x) * 100
+        return abs(n.x - shoulder_center_x) * POSE_THRESHOLDS["coord_scale"]
 
     def _calc_head_drop(self, n, ls, rs):
         sw = abs(ls.x - rs.x)
-        return ((ls.y + rs.y) / 2 - n.y) / sw if sw > 0.01 else 0
+        return ((ls.y + rs.y) / 2 - n.y) / sw if sw > POSE_THRESHOLDS["shoulder_width_eps"] else 0
 
     def _evaluate_head_pose(self, tilt, drop):
-        if tilt > 20: return "明显偏移"
-        elif tilt > 10: return "轻微偏移"
-        elif drop < 0.15: return "明显低头"
-        elif drop < 0.35: return "轻微低头"
+        """头部姿态分级（阈值全部取自 POSE_THRESHOLDS）"""
+        th = POSE_THRESHOLDS
+        if tilt > th["head_tilt_major"]: return "明显偏移"
+        elif tilt > th["head_tilt_minor"]: return "轻微偏移"
+        elif drop < th["head_drop_major"]: return "明显低头"
+        elif drop < th["head_drop_minor"]: return "轻微低头"
         else: return "端正"
 
     def _calc_body_sway(self, ls, rs, lh, rh):
-        return abs((ls.x + rs.x) / 2 - (lh.x + rh.x) / 2) * 100
+        return abs((ls.x + rs.x) / 2 - (lh.x + rh.x) / 2) * POSE_THRESHOLDS["coord_scale"]
 
     def _evaluate_body_stability(self, sl, sway):
         th = POSE_THRESHOLDS
@@ -1233,23 +1360,16 @@ class MediaPipePoseAnalyzer:
         elif sl > th["shoulder_level_minor"] or sway > th["body_sway_minor"]: return "轻微晃动"
         else: return "稳定"
 
-    def _evaluate_eye_focus(self, n, ls, rs):
-        """（保留兼容：旧方法，新版 analyze 不再调用）"""
-        shoulder_center_x = (ls.x + rs.x) / 2
-        offset = abs(n.x - shoulder_center_x) * 100
-        if offset > 18: return "频繁偏离"
-        elif offset > 9: return "偶尔偏离"
-        else: return "注视屏幕"
-
     def _calc_ear(self, face_landmarks):
         """基于 Face Mesh 关键点计算 EAR（眼纵横比），闭眼时 EAR 接近 0"""
+        ear_default = POSE_THRESHOLDS["ear_default"]
         if face_landmarks is None:
-            return 0.3
+            return ear_default
         def _ear(p1, p2, p3, p4, p5, p6):
             v1 = math.hypot(p2.x - p6.x, p2.y - p6.y)
             v2 = math.hypot(p3.x - p5.x, p3.y - p5.y)
             h = math.hypot(p1.x - p4.x, p1.y - p4.y)
-            if h < 1e-6: return 0.3
+            if h < 1e-6: return ear_default
             return (v1 + v2) / (2.0 * h)
         left = _ear(
             face_landmarks[33], face_landmarks[160], face_landmarks[158],
@@ -1260,10 +1380,11 @@ class MediaPipePoseAnalyzer:
         return (left + right) / 2.0
 
     def _evaluate_fatigue(self, ear):
-        """基于 EAR 判断疲劳等级：< 0.22 明显疲劳，< 0.30 轻度疲劳，否则清醒"""
+        """基于 EAR 判断疲劳等级：低于 ear_fatigue_major 明显疲劳，低于 ear_fatigue_minor 轻度疲劳"""
         if ear is None or ear <= 0: return "未知"
-        if ear < 0.22: return "明显疲劳"
-        if ear < 0.30: return "轻度疲劳"
+        th = POSE_THRESHOLDS
+        if ear < th["ear_fatigue_major"]: return "明显疲劳"
+        if ear < th["ear_fatigue_minor"]: return "轻度疲劳"
         return "精力充沛"
 
     def _calc_iris_offset(self, face_landmarks):
@@ -1283,40 +1404,42 @@ class MediaPipePoseAnalyzer:
 
     # ========== 姿态稳定性评估 ==========
     def _calculate_pose_stability(self, head_tilt, shoulder_level):
-        """计算姿态稳定性"""
+        """计算姿态稳定性（窗口与归一系数取自 POSE_STABILITY）"""
+        ps = POSE_STABILITY
         self.head_tilt_history.append(head_tilt)
         self.shoulder_history.append(shoulder_level)
 
-        if len(self.head_tilt_history) > 10:
+        if len(self.head_tilt_history) > ps["history_size"]:
             self.head_tilt_history.pop(0)
-        if len(self.shoulder_history) > 10:
+        if len(self.shoulder_history) > ps["history_size"]:
             self.shoulder_history.pop(0)
 
-        if len(self.head_tilt_history) < 3:
+        if len(self.head_tilt_history) < ps["min_history"]:
             return 1.0
 
         tilt_variance = np.var(self.head_tilt_history)
         shoulder_variance = np.var(self.shoulder_history)
-        stability = max(0, 1 - (tilt_variance / 100 + shoulder_variance * 10))
+        stability = max(0, 1 - (tilt_variance / ps["tilt_var_scale"] + shoulder_variance * ps["shoulder_var_scale"]))
         return stability
 
     # ========== 时序平滑 ==========
     def _smooth_focus_score(self, raw_score):
-        """对专注度分数进行指数平滑，减少短期波动"""
+        """对专注度分数进行指数平滑，减少短期波动（参数取自 SCORE_SMOOTHING）"""
+        sm = SCORE_SMOOTHING
         self.focus_score_history.append(raw_score)
-        if len(self.focus_score_history) > 15:
+        if len(self.focus_score_history) > sm["history_size"]:
             self.focus_score_history.pop(0)
-        if len(self.focus_score_history) < 3:
+        if len(self.focus_score_history) < sm["min_history"]:
             return raw_score
-        # 使用更强的平滑权重（0.9），让历史分数影响更大
-        weights = [0.9 ** (len(self.focus_score_history) - 1 - i) for i in range(len(self.focus_score_history))]
+        # 指数衰减权重，让近期分数权重更高
+        weights = [sm["decay"] ** (len(self.focus_score_history) - 1 - i) for i in range(len(self.focus_score_history))]
         weights = [w / sum(weights) for w in weights]
         smoothed = sum(s * w for s, w in zip(self.focus_score_history, weights))
-        # 增加惯性：如果新分数与历史均值差距<10，更倾向于保持当前趋势
-        if len(self.focus_score_history) >= 5:
-            recent_avg = sum(self.focus_score_history[-5:]) / 5
-            if abs(smoothed - recent_avg) < 8:
-                smoothed = 0.7 * smoothed + 0.3 * recent_avg
+        # 增加惯性：如果新分数与历史均值差距很小，更倾向于保持当前趋势
+        if len(self.focus_score_history) >= sm["inertia_window"]:
+            recent_avg = sum(self.focus_score_history[-sm["inertia_window"]:]) / sm["inertia_window"]
+            if abs(smoothed - recent_avg) < sm["inertia_gap"]:
+                smoothed = sm["inertia_blend"] * smoothed + (1 - sm["inertia_blend"]) * recent_avg
         return round(smoothed)
 
     # ========== 动作小分类检测 ==========
@@ -1330,6 +1453,10 @@ class MediaPipePoseAnalyzer:
         - distracted: 其他分心行为
         """
         if head_pose_status == "端正" and eye_focus_status == "注视屏幕" and fatigue_status == "精力充沛":
+            return "focused"
+        # P3-2 配套：人脸未检出时眼神/疲劳为中性的「未检测」，此时不应据此判为分心；
+        # 只要头姿端正且身体稳定，即按专注处理，避免短暂转头触发误判。
+        if eye_focus_status == "未检测" and head_pose_status == "端正" and body_stability_status == "稳定":
             return "focused"
 
         # 获取关键点
@@ -1347,6 +1474,7 @@ class MediaPipePoseAnalyzer:
         hip_center_y = (left_hip.y + right_hip.y) / 2
         torso_mid_y = (shoulder_center_y + hip_center_y) / 2
         shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
+        at = ACTION_THRESHOLDS
 
         # ===== 睡觉检测 =====
         # 头部严重下垂（鼻子y坐标远低于肩膀）+ 眼睛闭合 + 身体稳定
@@ -1354,30 +1482,29 @@ class MediaPipePoseAnalyzer:
         is_eyes_closed = fatigue_status == "明显疲劳" or eye_focus_status == "闭眼/走神"
         is_body_still = body_stability_status == "稳定"
 
-        if head_drop_ratio > 0.15 and is_eyes_closed and is_body_still:
+        if head_drop_ratio > at["sleep_head_drop_ratio"] and is_eyes_closed and is_body_still:
             return "sleep"
 
         # 备选：头部略微下垂 + 眼睛闭合 + 长期不动也判定为睡觉
-        if head_drop_ratio > 0.08 and is_eyes_closed and is_body_still and fatigue_status == "明显疲劳":
+        if head_drop_ratio > at["sleep_head_drop_ratio_loose"] and is_eyes_closed and is_body_still and fatigue_status == "明显疲劳":
             return "sleep"
 
         # ===== 玩手机检测 =====
         # 手腕在躯干前方区域（允许在肩膀上方，因为举手机时手会抬高）
-        # 范围：肩膀上方0.15到臀部下方0.05
-        left_wrist_in_torso = (left_wrist.y > shoulder_center_y - 0.15 and
-                               left_wrist.y < hip_center_y + 0.05)
-        right_wrist_in_torso = (right_wrist.y > shoulder_center_y - 0.15 and
-                                right_wrist.y < hip_center_y + 0.05)
+        left_wrist_in_torso = (left_wrist.y > shoulder_center_y - at["wrist_torso_above_shoulder"] and
+                               left_wrist.y < hip_center_y + at["wrist_torso_below_hip"])
+        right_wrist_in_torso = (right_wrist.y > shoulder_center_y - at["wrist_torso_above_shoulder"] and
+                                right_wrist.y < hip_center_y + at["wrist_torso_below_hip"])
 
-        # 手腕靠近身体中心线（水平距离小于肩宽的80%，更宽松）
+        # 手腕靠近身体中心线（水平距离小于肩宽的给定比例，更宽松）
         shoulder_width = abs(left_shoulder.x - right_shoulder.x)
-        left_wrist_near_center = abs(left_wrist.x - shoulder_center_x) < shoulder_width * 0.8
-        right_wrist_near_center = abs(right_wrist.x - shoulder_center_x) < shoulder_width * 0.8
+        left_wrist_near_center = abs(left_wrist.x - shoulder_center_x) < shoulder_width * at["wrist_center_ratio"]
+        right_wrist_near_center = abs(right_wrist.x - shoulder_center_x) < shoulder_width * at["wrist_center_ratio"]
 
         # 肘部弯曲检测：手臂收起时，手腕与肘部的y坐标差距不大（无论上下）
         # 或者手腕在肘部上方（举着手机）
-        left_elbow_bent = abs(left_wrist.y - left_elbow.y) < 0.15 or left_wrist.y < left_elbow.y
-        right_elbow_bent = abs(right_wrist.y - right_elbow.y) < 0.15 or right_wrist.y < right_elbow.y
+        left_elbow_bent = abs(left_wrist.y - left_elbow.y) < at["elbow_bend_dy"] or left_wrist.y < left_elbow.y
+        right_elbow_bent = abs(right_wrist.y - right_elbow.y) < at["elbow_bend_dy"] or right_wrist.y < right_elbow.y
 
         # 综合判断：至少一只手在胸前区域 + 肘部弯曲
         # 玩手机的典型姿势：手在胸前/脸前，手臂弯曲收起
@@ -1399,46 +1526,56 @@ class MediaPipePoseAnalyzer:
 
     def _smooth_action(self, action):
         """对动作分类进行时序平滑，避免频繁跳变"""
+        at = ACTION_THRESHOLDS
         self.action_history.append(action)
-        if len(self.action_history) > 8:
+        if len(self.action_history) > at["action_history_size"]:
             self.action_history.pop(0)
-        if len(self.action_history) < 3:
+        if len(self.action_history) < at["action_vote_min"]:
             return action
-        # 取最近5帧的众数
-        recent = self.action_history[-5:]
+        # 取最近若干帧的众数
+        recent = self.action_history[-at["action_vote_window"]:]
         most_common = Counter(recent).most_common(1)[0]
         return most_common[0]
 
     # ========== 评分算法 ==========
     def _calculate_focus_score(self, hp, bs, fat, ef, scene, stability=1.0):
+        """规则引擎评分（可解释、可单测）：所有扣分/加分均取自 SCORE_PENALTIES
+
+        P1-8 / P3-2：数值与重构前硬编码字面量完全一致，行为零漂移；
+        「未检测」类中性状态（人脸未检出的疲劳/眼神）不参与扣分。
+        """
+        p = SCORE_PENALTIES
         s = 100
-        if hp == "明显偏移": s -= 20
-        elif hp == "轻微偏移": s -= 10
-        elif hp == "明显低头": s -= 8
-        elif hp == "轻微低头": s -= 4
-        if bs == "明显晃动": s -= 12
-        elif bs == "轻微晃动": s -= 5
-        if fat == "明显疲劳": s -= 15
-        elif fat == "轻度疲劳": s -= 8
+        if hp == "明显偏移": s -= p["head_pose_major"]
+        elif hp == "轻微偏移": s -= p["head_pose_minor"]
+        elif hp == "明显低头": s -= p["head_down_major"]
+        elif hp == "轻微低头": s -= p["head_down_minor"]
+        if bs == "明显晃动": s -= p["body_major"]
+        elif bs == "轻微晃动": s -= p["body_minor"]
+        if fat == "明显疲劳": s -= p["fatigue_major"]
+        elif fat == "轻度疲劳": s -= p["fatigue_minor"]
         # 眼神状态：闭眼/走神最严重，视线模糊次之，偶尔偏离（正常眨眼）扣分很少
-        if ef == "闭眼/走神": s -= 30
-        elif ef == "视线模糊": s -= 18
-        elif ef == "频繁偏离": s -= 12
-        elif ef == "偶尔偏离": s -= 3
-        if stability > 0.85: s += 4
-        elif stability < 0.2: s -= 3
-        if scene == "onetoone": s = min(s + 3, 100)
-        elif scene == "online": s = max(s - 3, 10)
-        return max(10, min(100, s))
+        if ef == "闭眼/走神": s -= p["eye_closed"]
+        elif ef == "视线模糊": s -= p["eye_blur"]
+        elif ef == "频繁偏离": s -= p["eye_deviation_frequent"]
+        elif ef == "偶尔偏离": s -= p["eye_deviation_occasional"]
+        # 「未检测」不命中任何分支 → 不加不减
+        if stability > p["stability_high"]: s += p["stability_bonus"]
+        elif stability < p["stability_low"]: s -= p["stability_penalty"]
+        if scene == "onetoone": s = min(s + p["scene_onetoone_bonus"], p["score_max"])
+        elif scene == "online": s = max(s - p["scene_online_penalty"], p["score_min"])
+        return max(p["score_min"], min(p["score_max"], s))
 
     def _generate_suggestion(self, fs, hp, fat, scene):
-        if fs >= 80: return random.choice(["✅ 专注度极佳，保持当前学习节奏！", "✅ 学习状态非常好，继续保持！", "✅ 你的专注力令人印象深刻！"])
-        elif fs >= 60:
+        # P1-8：分档阈值统一取 WARNING_LEVELS（excellent / mild / moderate），低于 moderate 视为严重分心
+        lv = WARNING_LEVELS
+        if fs >= lv["excellent"]: return random.choice(["✅ 专注度极佳，保持当前学习节奏！", "✅ 学习状态非常好，继续保持！", "✅ 你的专注力令人印象深刻！"])
+        elif fs >= lv["mild"]:
             if "偏移" in hp: return "💡 注意调整坐姿，保持头部端正有助于集中注意力"
             if "低头" in hp: return "💡 检测到轻微低头，适当调整坐姿，保持平视"
             if fat == "轻度疲劳": return "💡 检测到轻微疲劳，建议调整呼吸，做几次深呼吸"
             return "💡 状态良好，建议适时调整坐姿，预防疲劳"
-        elif fs >= 40:
+        elif fs >= lv["moderate"]:
             if fat == "明显疲劳": return "⚠️ 检测到疲劳信号，建议闭眼休息30秒再继续"
             if "偏移" in hp: return "⚠️ 头部偏移较大，请调整坐姿，保持正视屏幕"
             if "低头" in hp: return "⚠️ 低头时间较长，建议抬抬头活动颈椎"
@@ -1455,7 +1592,11 @@ class MediaPipePoseAnalyzer:
             "suggestion": "未检测到人体，请确保摄像头能拍摄到上半身",
             "pose_detected": False,
             "annotated_image": image_base64,
-            "model_prediction": "", "model_enabled": self.model_loaded
+            "model_prediction": "", "model_enabled": self.model_loaded,
+            # P1-4：与正常分支保持同一套双轨字段契约，便于前端统一处理
+            "model_available": False, "model": None,
+            "score_source": "rule", "rule_score": None,
+            "pose_stability": 0.0,
         }
 
 
