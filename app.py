@@ -19,6 +19,7 @@ import sys
 import pickle
 import numpy as np
 import hashlib
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
@@ -56,17 +57,55 @@ except ImportError:
     TTS_CONFIG = {"enabled": True, "language": "zh-CN", "rate": 0.9, "pitch": 1.1, "volume": 0.8, "cooldown": 30}
     POSE_CONFIG = {"static_image_mode": True, "model_complexity": 1, "min_detection_confidence": 0.5, "min_tracking_confidence": 0.5}
     POSE_THRESHOLDS = {"head_tilt_minor": 10, "head_tilt_major": 20, "head_drop_minor": 0.6, "head_drop_major": 0.3, "body_sway_minor": 8, "body_sway_major": 15, "shoulder_level_minor": 0.08, "shoulder_level_major": 0.15, "consecutive_low_focus": 3}
-    JWT_SECRET_KEY = "your-secret-key-change-in-production"
+    # P0-5：此处不再内置任何可用密钥，留空后交由下方「安全配置加固」段处理
+    # （优先读取环境变量 AI_STUDY_JWT_SECRET，未配置则生成进程内随机密钥）
+    JWT_SECRET_KEY = ""
     JWT_ALGORITHM = "HS256"
     JWT_EXPIRE_DAYS = 7
+
+# ========== 安全配置加固（P0-5 / P0-6） ==========
+# P0-5 JWT 密钥：不再使用硬编码兜底密钥，改为「环境变量优先 + 缺失时进程内随机生成」。
+#   环境变量名：AI_STUDY_JWT_SECRET
+#   设置示例（Windows PowerShell）：$env:AI_STUDY_JWT_SECRET="<足够长的随机字符串>"
+#   若未设置、或仍是示例占位串，则生成一次性随机密钥：服务可正常启动，
+#   但重启后旧令牌全部失效、需重新登录。生产环境务必显式配置该环境变量。
+_INSECURE_JWT_SECRETS = {
+    "",
+    "your-secret-key-change-in-production",
+    "change-me",
+    "changeme",
+    "secret",
+}
+
+_ENV_JWT_SECRET = (os.getenv("AI_STUDY_JWT_SECRET") or "").strip()
+if _ENV_JWT_SECRET:
+    JWT_SECRET_KEY = _ENV_JWT_SECRET
+if str(JWT_SECRET_KEY or "").strip() in _INSECURE_JWT_SECRETS:
+    JWT_SECRET_KEY = secrets.token_urlsafe(48)
+    print("[安全警告] 未配置环境变量 AI_STUDY_JWT_SECRET，已生成进程内临时 JWT 密钥：服务重启后所有登录令牌将失效，生产环境请务必配置该环境变量。")
+
+# P0-6 CORS：禁止 allow_origins=["*"] 与 allow_credentials=True 同时出现（浏览器规范不允许该组合）。
+#   环境变量名：AI_STUDY_CORS_ORIGINS，多个来源用英文逗号分隔
+#   设置示例：http://localhost:8001,https://foucs-analyze.cyou
+#   未配置时仅放行本机同端口来源，避免任意站点携带凭证跨域访问接口。
+_ENV_CORS_ORIGINS = (os.getenv("AI_STUDY_CORS_ORIGINS") or "").strip()
+if _ENV_CORS_ORIGINS:
+    CORS_ALLOW_ORIGINS = [o.strip() for o in _ENV_CORS_ORIGINS.split(",") if o.strip()]
+else:
+    CORS_ALLOW_ORIGINS = [f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"]
+
+# 通配来源与凭证模式互斥：来源中出现 "*" 时强制关闭凭证，防止任意站点越权读取 Cookie / Authorization
+CORS_ALLOW_CREDENTIALS = "*" not in CORS_ALLOW_ORIGINS
+if not CORS_ALLOW_CREDENTIALS:
+    print("[安全警告] CORS 来源白名单中包含通配符 \"*\"，已自动关闭 allow_credentials。")
 # ========== MediaPipe 姿态识别 ==========
 app = FastAPI()
 security = HTTPBearer()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,            # P0-6：来源白名单，由环境变量 AI_STUDY_CORS_ORIGINS 配置
+    allow_credentials=CORS_ALLOW_CREDENTIALS,    # P0-6：来源含通配符时强制关闭凭证
     allow_methods=["*"],
     allow_headers=["*"],
 )
