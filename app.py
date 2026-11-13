@@ -21,8 +21,8 @@ import numpy as np
 import hashlib
 import sqlite3
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, HTTPException, Depends, status, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -1957,14 +1957,6 @@ HTML = '''
         function showTeacherRegister() { showPage('teacherRegisterPage'); }
 
 
-
-
-
-
-
-
-
-
         // ========== 登录角色切换 ==========
         function switchLoginRole(role) {
             loginRole = role;
@@ -2287,7 +2279,6 @@ HTML = '''
         }
 
 
-
         function initMonitor() {
             initCamera();
             initWebSocket();
@@ -2298,7 +2289,7 @@ HTML = '''
             studyStartTime = Date.now();
             updateStudyDuration();
             behaviorSaveInterval = setInterval(saveBehaviorToBackend, 60000);
-            // 轮询获取 Coze 发来的提醒通知
+            // 轮询获取提醒通知
             notificationInterval = setInterval(checkNotifications, 3000);
         }
 
@@ -2552,138 +2543,6 @@ HTML = '''
 '''
 
 
-# ========== Coze API 路由（供 Coze Bot 调用） ==========
-
-@app.get("/api/coze/students")
-async def coze_get_students():
-    """Coze: 获取所有学生列表"""
-    try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, username, name, student_no, class_name FROM students")
-        students = []
-        for row in cursor.fetchall():
-            students.append({
-                "id": row[0],
-                "username": row[1],
-                "name": row[2] or "",
-                "student_no": row[3] or "",
-                "class_name": row[4] or ""
-            })
-        conn.close()
-        return {"success": True, "students": students, "count": len(students)}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/coze/student/online")
-async def coze_get_online_students():
-    try:
-        online = []
-        for student_id, cache in student_video_cache.items():
-            is_online = (time.time() - cache.get("timestamp", 0)) < 10
-            if is_online:
-                online.append({
-                    "id": student_id,
-                    "name": cache.get("name", f"学生{student_id}"),
-                    "focus_score": cache.get("focus_score", 0),
-                    "action_label": cache.get("action_label", "unknown"),
-                    "action_label_cn": {"focused": "专注", "sleep": "睡觉", "playphone": "玩手机", "distracted": "分心"}.get(cache.get("action_label", "unknown"), "未知")
-                })
-        
-        return {
-            "success": True,
-            "online_students": online,  # 保留原名
-            "students": online,         # ✅ 新增别名，兼容 Coze
-            "count": len(online)
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/coze/student/live")
-async def coze_student_live(
-    student_id: int = Query(..., description="学生ID")
-):
-    """Coze Bot 获取学生实时状态"""
-    student = get_student_by_id(student_id)    
-    if not student:
-        raise HTTPException(status_code=404, detail="学生不存在")
-    
-    cache = get_student_video_cache(student_id)
-    if not cache:
-        return {
-            "student_id": student_id,
-            "student_name": student["name"],
-            "online": False,
-            "message": "学生未在线或未开启监控"
-        }
-    
-    is_online = (time.time() - cache["timestamp"]) < 10
-    
-    return {
-        "student_id": student_id,
-        "student_name": student["name"],
-        "online": is_online,
-        "focus_score": cache["focus_score"],
-        "image_base64": cache.get("image", ""),  # ✅ 新增: 返回截图
-        "timestamp": cache["timestamp"]
-    }
-
-
-@app.get("/api/coze/student/records")
-async def coze_student_records(
-    student_id: int = Query(..., description="学生ID"),
-    limit: int = Query(10, description="返回记录数量", ge=1, le=100)
-):
-    """Coze Bot 获取学生行为记录"""
-    student = get_student_by_id(student_id)
-    if not student:
-        raise HTTPException(status_code=404, detail="学生不存在")
-    
-    records = get_student_behavior_records(student_id, limit=limit)
-    
-   # 简化记录，只返回关键字段
-    simplified_records = []
-    for r in records:
-        simplified_records.append({
-            "focus_score": r.get("focus_score"),
-            "distraction_count": r.get("distraction_count"),
-            "head_pose": r.get("head_pose"),
-            "body_stability": r.get("body_stability"),
-            "fatigue_level": r.get("fatigue_level"),
-            "eye_focus": r.get("eye_focus"),
-            "suggestion": r.get("suggestion"),
-            "created_at": r.get("created_at")
-        })
-    
-    return {
-        "student_id": student_id,
-        "student_name": student["name"],
-        "total_records": len(simplified_records),
-        "records": simplified_records
-    }
-
-
-# 发送语音提醒
-@app.post("/api/coze/student/notify")
-async def coze_notify_student(
-    student_id: int = Query(..., description="学生ID"),
-    message: str = Query(..., description="提醒内容")
-):
-    """Coze: 向学生发送语音提醒"""
-    try:
-        # 将提醒存入数据库或内存，学生端轮询获取
-        notification = {
-            "student_id": student_id,
-            "message": message,
-            "timestamp": time.time(),
-            "type": "voice"
-        }
-        # 存储到全局变量或数据库
-        student_notifications[student_id] = notification
-        return {"success": True, "message": "提醒已发送"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
 # 调试接口：查看所有缓存
 @app.get("/api/debug/cache")
 async def debug_cache():
@@ -2702,167 +2561,6 @@ async def debug_cache():
         "caches": result
     }
 
-# 获取学生最新截图 (返回 JSON，包含 image_url 图片链接，供 Coze 使用)
-@app.get("/api/coze/student/snapshot")
-async def coze_get_snapshot(
-    student_id: int = Query(..., description="学生ID"),
-    base_url: str = Query("https://foucs-analyze.cyou", description="API 基础地址")
-):
-    """Coze: 获取学生摄像头最新截图，返回 JSON（轻量，不含 base64）"""
-    try:
-        print(f"🔍 查询截图: student_id={student_id}")
-        cache = get_student_video_cache(student_id)
-        
-        if cache:
-            cache_age = time.time() - cache.get("timestamp", 0)
-            print(f"📦 缓存状态: has_image={cache.get('image') is not None}, age={cache_age:.1f}秒")
-        else:
-            print(f"📦 缓存状态: cache=None")
-        
-        if not cache or not cache.get("image"):
-            print(f"❌ 无截图: student_id={student_id}")
-            return {
-                "success": False,
-                "student_id": student_id,
-                "image_url": "",
-                "timestamp": 0,
-                "message": "暂无截图，学生可能未开启摄像头"
-            }
-
-        print(f"✅ 返回图片链接: student_id={student_id}")
-        
-        # 生成图片 URL（指向二进制图片接口）
-        image_url = f"{base_url}/api/coze/student/snapshot/image?student_id={student_id}"
-        
-        return {
-            "success": True,
-            "student_id": student_id,
-            "image_url": image_url,
-            "timestamp": cache.get("timestamp", 0),
-            "message": "获取成功"
-        }
-    except Exception as e:
-        print(f"❌ 截图异常: {e}")
-        return {
-            "success": False,
-            "student_id": student_id,
-            "image_url": "",
-            "timestamp": 0,
-            "focus_score": cache.get("focus_score", 0),
-            "message": str(e)
-        }
-
-
-# 获取学生截图图片 (返回二进制 JPEG 图片)
-@app.get("/api/coze/student/snapshot/image")
-async def coze_get_snapshot_image(
-    student_id: int = Query(..., description="学生ID")
-):
-    """返回学生摄像头截图的二进制 JPEG 图片"""
-    try:
-        cache = get_student_video_cache(student_id)
-        if not cache or not cache.get("image"):
-            # 返回 1x1 透明 PNG 占位图
-            import io
-            placeholder = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
-            return StreamingResponse(io.BytesIO(placeholder), media_type="image/png")
-
-        import io
-        from urllib.parse import quote
-        image_bytes = base64.b64decode(cache["image"])
-        student_name = cache.get("name", "")
-        return StreamingResponse(
-            io.BytesIO(image_bytes),
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "no-cache, no-store",
-                "X-Student-ID": str(student_id),
-                "X-Student-Name": quote(student_name, safe=''),
-                "X-Focus-Score": str(cache.get("focus_score", 0)),
-            }
-        )
-    except Exception as e:
-        import io
-        placeholder = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
-        return StreamingResponse(io.BytesIO(placeholder), media_type="image/png")
-
-
-# 获取学生最新截图
-@app.get("/api/coze/student/snapshot/json")
-async def coze_get_snapshot_json(
-    student_id: int = Query(..., description="学生ID")
-):
-    """Coze: 获取学生摄像头最新截图 (JSON 格式，包含 base64)"""
-    try:
-        cache = get_student_video_cache(student_id)
-        if not cache or not cache.get("image"):
-            return {"success": False, "message": "暂无截图，学生可能未开启摄像头"}
-
-        return {
-            "success": True,
-            "student_id": student_id,
-            "student_name": cache.get("name", ""),
-            "image_base64": cache["image"],
-            "focus_score": cache.get("focus_score"),
-            "timestamp": cache["timestamp"]
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# Coze 插件：获取学生实时动作分类
-@app.get("/api/coze/student/action")
-async def coze_student_action(
-    student_id: int = Query(..., description="学生ID")
-):
-    """
-    Coze 插件接口：获取学生当前动作分类
-    返回：focused / sleep / playphone / distracted
-    """
-    try:
-        student = get_student_by_id(student_id)
-        if not student:
-            raise HTTPException(status_code=404, detail="学生不存在")
-
-        cache = get_student_video_cache(student_id)
-        if not cache:
-            return {
-                "success": True,
-                "student_id": student_id,
-                "student_name": student["name"],
-                "online": False,
-                "action_label": "unknown",
-                "action_label_cn": "未知",
-                "focus_score": 0,
-                "message": "学生未在线"
-            }
-
-        is_online = (time.time() - cache["timestamp"]) < 10
-        action_label = cache.get("action_label", "unknown")
-
-        # 动作标签中文映射
-        action_map = {
-            "focused": "专注",
-            "sleep": "睡觉",
-            "playphone": "玩手机",
-            "distracted": "分心",
-            "unknown": "未知"
-        }
-
-        return {
-            "success": True,
-            "student_id": student_id,
-            "student_name": student["name"],
-            "online": is_online,
-            "action_label": action_label,
-            "action_label_cn": action_map.get(action_label, "未知"),
-            "focus_score": cache.get("focus_score", 0),
-            "head_pose": cache.get("head_pose", ""),
-            "eye_focus": cache.get("eye_focus", ""),
-            "fatigue_level": cache.get("fatigue_level", ""),
-            "timestamp": cache["timestamp"]
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 @app.get("/")
 async def root():
