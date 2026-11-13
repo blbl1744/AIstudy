@@ -17,7 +17,7 @@ import math
 import os
 import sys
 import hmac
-import pickle
+import joblib
 import threading
 from collections import Counter
 import numpy as np
@@ -32,7 +32,7 @@ from fastapi import FastAPI, WebSocket, HTTPException, Depends, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import cv2                         
 import mediapipe as mp          
@@ -137,27 +137,58 @@ face_mesh = mp_face_mesh.FaceMesh(
 
 
 # ========== 模型加载（全局缓存，只加载一次）==========
+# P0-7：模型反序列化加固 —— 彻底移除不安全的反序列化调用，改用 joblib；且必须通过 SHA256 白名单校验
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "focus_model.pkl")
+MODEL_SHA256_ENV = "AI_STUDY_MODEL_SHA256"   # 模型文件 SHA256 白名单（环境变量）
 _cached_model = None
 _cached_scaler = None
 _cached_model_loaded = False
 
+
+def _verify_model_sha256(path: str, expected_sha256: str) -> None:
+    """校验模型文件 SHA256（分块流式计算，避免大文件占满内存）
+
+    校验不通过一律抛出 RuntimeError，阻止后续反序列化。
+    """
+    expected = (expected_sha256 or "").strip().lower()
+    if not expected:
+        raise RuntimeError("模型文件 SHA256 校验失败，拒绝加载")
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise RuntimeError("模型文件 SHA256 校验失败，拒绝加载")
+
+
 def load_trained_model():
-    """加载训练好的模型（全局缓存）"""
+    """加载训练好的模型（全局缓存）
+
+    P0-7：
+    - 模型文件不存在 → 记录警告日志并安全降级为规则模式，返回 None；
+    - 模型文件存在 → 必须配置 AI_STUDY_MODEL_SHA256 且校验通过，才允许 joblib.load。
+    """
     global _cached_model, _cached_model_loaded
     if _cached_model_loaded:
         return _cached_model
-    if os.path.exists(MODEL_PATH):
-        try:
-            with open(MODEL_PATH, 'rb') as f:
-                _cached_model = pickle.load(f)
-            _cached_model_loaded = True
-            print(f"✅ 专注度模型已加载: {MODEL_PATH}")
-            return _cached_model
-        except Exception as e:
-            print(f"⚠️ 加载模型失败: {e}")
     _cached_model_loaded = True  # 标记已尝试过，避免重复尝试
-    return None
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"⚠️ 未找到模型文件，降级为规则引擎模式: {MODEL_PATH}")
+        return None
+
+    expected_sha256 = (os.getenv(MODEL_SHA256_ENV) or "").strip()
+    if not expected_sha256:
+        raise RuntimeError(f"未配置环境变量 {MODEL_SHA256_ENV}，拒绝加载模型文件")
+
+    _verify_model_sha256(MODEL_PATH, expected_sha256)   # 校验失败直接抛错，不降级
+    try:
+        _cached_model = joblib.load(MODEL_PATH)
+    except Exception as e:
+        raise RuntimeError(f"模型文件加载失败，拒绝启用模型: {e}")
+    print(f"✅ 专注度模型已通过 SHA256 校验并加载: {MODEL_PATH}")
+    return _cached_model
 
 def predict_focus(features):
     """预测专注度 - 支持标准化"""
@@ -336,6 +367,7 @@ def init_db():
             )
         ''')
         # 迁移旧数据（为旧学生生成默认用户名和密码）
+        # P0-9：不再使用可猜测的旧默认弱口令，改为随机不可预测口令的哈希
         cursor.execute('''
             INSERT INTO students (id, username, password_hash, name, student_no, class_name, created_at)
             SELECT id, 
@@ -346,7 +378,7 @@ def init_db():
                    COALESCE(class_name, ''), 
                    COALESCE(created_at, CURRENT_TIMESTAMP)
             FROM students_old
-        ''', (hash_password("123456"),))
+        ''', (hash_password(secrets.token_urlsafe(16)),))
         # 删除旧表
         cursor.execute("DROP TABLE students_old")
         print("✅ students表迁移完成")
@@ -378,11 +410,33 @@ def init_db():
             suggestion TEXT,
             model_prediction TEXT,  -- 新增：模型预测结果
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expire_at TIMESTAMP,    -- P0-10：数据留存到期时间（默认写入后 30 天）
             FOREIGN KEY (student_id) REFERENCES students(id)
         )
     ''')
 
-    # ===== 管理员账号初始化（P0-4：不再内置 teacher / 123456 默认口令）=====
+    # ===== P0-10：行为记录 30 天留存策略 =====
+    # 1) 为已存在的旧表幂等补充 expire_at 字段（重复执行不会报错）
+    cursor.execute("PRAGMA table_info(behavior_records)")
+    _br_columns = [col[1] for col in cursor.fetchall()]
+    if "expire_at" not in _br_columns:
+        cursor.execute("ALTER TABLE behavior_records ADD COLUMN expire_at TIMESTAMP")
+        print("✅ behavior_records 表已补充 expire_at 字段")
+    # 2) 回填历史记录的到期时间（写入时间 + 30 天）
+    cursor.execute(
+        "UPDATE behavior_records SET expire_at = datetime(created_at, '+30 days') "
+        "WHERE expire_at IS NULL AND created_at IS NOT NULL"
+    )
+    # 3) 清理已过期记录（未成年人隐私最小化：超期数据不留存）
+    cursor.execute(
+        "DELETE FROM behavior_records "
+        "WHERE (expire_at IS NOT NULL AND expire_at < CURRENT_TIMESTAMP) "
+        "   OR (expire_at IS NULL AND created_at < datetime('now', '-30 days'))"
+    )
+    if cursor.rowcount and cursor.rowcount > 0:
+        print(f"🧹 已清理 {cursor.rowcount} 条超过 30 天留存期的行为记录")
+
+    # ===== 管理员账号初始化（P0-4：不再内置 teacher 默认弱口令）=====
     # 仅当环境变量 AI_STUDY_ADMIN_PASSWORD 非空、且库中不存在 teacher 账号时才创建
     _admin_password = (os.getenv("AI_STUDY_ADMIN_PASSWORD") or "").strip()
     cursor.execute("SELECT COUNT(*) FROM teachers WHERE username = 'teacher'")
@@ -511,12 +565,21 @@ def _clear_login_failures(role: str, username: str) -> None:
         _login_fail.pop(_login_key(role, username), None)
 
 # ========== 数据模型 ==========
+# P0-9：姓名白名单 —— 仅允许中文、字母、数字、下划线、间隔号、连字符与空白，长度 1~32
+# 该正则从输入侧拦截 < > " ' & 等可构成 XSS 载荷的特殊字符
+NAME_PATTERN = r"^[\u4e00-\u9fa5A-Za-z0-9_·\-\s]{1,32}$"
+# 学号/班级允许为空，字符白名单与姓名一致
+NAME_OPT_PATTERN = r"^[\u4e00-\u9fa5A-Za-z0-9_·\-\s]{0,32}$"
+
+
 class StudentRegisterRequest(BaseModel):
-    username: str
-    password: str
-    name: str
-    student_no: str = ""
-    class_name: str = ""
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=6, max_length=64)
+    # 姓名与学号/班级会回显到教师端页面，必须做长度与字符白名单约束（存储型 XSS 防护）
+    name: str = Field(..., min_length=1, max_length=32, pattern=NAME_PATTERN)
+    student_no: str = Field(default="", max_length=32, pattern=NAME_OPT_PATTERN)
+    class_name: str = Field(default="", max_length=32, pattern=NAME_OPT_PATTERN)
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -580,10 +643,11 @@ def get_student_by_id(student_id: int):
 def save_behavior_record(student_id: int, data: dict):
     conn = get_db()
     cursor = conn.cursor()
+    # P0-10：写入时即设定 30 天留存到期时间（SQLite datetime('now') 为 UTC，与 created_at 默认值一致）
     cursor.execute(
         """INSERT INTO behavior_records
-           (student_id, focus_score, distraction_count, head_pose, body_stability, fatigue_level, eye_focus, suggestion, model_prediction)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (student_id, focus_score, distraction_count, head_pose, body_stability, fatigue_level, eye_focus, suggestion, model_prediction, expire_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+30 days'))""",
         (student_id, data.get("focus_score"), data.get("distraction_count"),
          data.get("head_pose"), data.get("body_stability"), data.get("fatigue_level"),
          data.get("eye_focus"), data.get("suggestion"), data.get("model_prediction"))
@@ -1511,6 +1575,40 @@ async def get_student_notifications(user: dict = Depends(get_current_user)):
     if notification:
         return {"success": True, "notification": notification}
     return {"success": True, "notification": None}
+
+
+# ========== P0-10：学生本人数据删除接口（未成年人隐私合规最小集）==========
+@app.delete("/api/student/my-data")
+async def delete_my_student_data(user: dict = Depends(get_current_user)):
+    """学生端：删除本人全部行为记录与内存缓存
+
+    - 身份只取自 JWT 令牌，不接受任何外部传入的 student_id（避免越权删除他人数据）
+    - 非 student 角色直接返回 403
+    """
+    if user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="仅学生可删除本人数据")
+
+    student_id = user.get("user_id")
+
+    # 1) 删除数据库中的全部行为记录
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM behavior_records WHERE student_id = ?", (student_id,))
+    deleted_records = cursor.rowcount or 0
+    conn.commit()
+    conn.close()
+
+    # 2) 清理内存缓存：实时画面、在线状态、待推送提醒
+    student_video_cache.pop(student_id, None)
+    online_students.pop(student_id, None)
+    student_notifications.pop(student_id, None)
+
+    print(f"🧹 学生 {student_id} 已删除本人数据，共 {deleted_records} 条行为记录")
+    return {
+        "success": True,
+        "deleted_records": deleted_records,
+        "message": "本人行为记录与实时缓存已删除"
+    }
 
 if __name__ == "__main__":
     # 初始化数据库

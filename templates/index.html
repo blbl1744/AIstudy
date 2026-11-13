@@ -514,6 +514,27 @@
 
     <!-- ===== 学生端：监控页面 ===== -->
     <div id="studentMonitorPage" class="page">
+        <!-- P0-10：隐私告知与知情同意遮罩（未勾选同意前不请求摄像头 / 麦克风） -->
+        <div id="privacyConsentMask" style="display: none; position: fixed; inset: 0; background: rgba(2, 6, 23, 0.9); z-index: 9999; align-items: center; justify-content: center; padding: 20px;">
+            <div class="card" style="max-width: 560px; width: 100%;">
+                <div class="card-title">🔒 隐私告知与学生知情同意</div>
+                <div style="font-size: 0.85rem; line-height: 1.8; color: #cbd5e1;">
+                    <p>1. 开启监控后本系统会调用摄像头采集你的学习画面，仅用于计算专注度（头部姿态、身体稳定性、疲劳与眼神状态），不作其他用途。</p>
+                    <p>2. 分析产生行为记录（专注度分数、分心次数等）默认仅保留 30 天，到期自动清理。</p>
+                    <p>3. 你可以随时点击「删除我的数据」，一键删除本人全部行为记录与实时缓存。</p>
+                    <p>4. 麦克风语音检测默认关闭，只有在你主动勾选开启后才会请求麦克风权限。</p>
+                    <p>5. 未满 18 周岁的同学，请在监护人知情并同意后使用本监控功能。</p>
+                </div>
+                <label style="display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; font-size: 0.85rem; color: #e2e8f0; cursor: pointer;">
+                    <input type="checkbox" id="privacyConsentCheckbox" style="margin-top: 3px;">
+                    <span>我已阅读并理解上述告知内容，同意在本次学习期间采集并分析我的学习画面。</span>
+                </label>
+                <div style="display: flex; gap: 10px; margin-top: 16px;">
+                    <button class="btn" onclick="confirmPrivacyConsent()">同意并开始监控</button>
+                    <button class="btn btn-outline" onclick="declinePrivacyConsent()">暂不同意</button>
+                </div>
+            </div>
+        </div>
         <div class="container">
             <div class="header">
                 <div class="header-left">
@@ -526,6 +547,7 @@
                         <span id="connectionText">已连接</span>
                     </span>
                     <span id="studentGreeting" style="color: #94a3b8; font-size: 0.85rem;"></span>
+                    <button class="btn btn-outline btn-small" onclick="deleteMyData()">🗑️ 删除我的数据</button>
                     <button class="btn btn-outline btn-small" onclick="logout()">退出</button>
                 </div>
             </div>
@@ -535,6 +557,11 @@
                 <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                     <span style="font-size: 0.85rem; color: #94a3b8;">当前场景：</span>
                     <button class="btn btn-outline" onclick="switchScene('onetoone')" id="btnOneToOne">👨‍🏫 1对1课堂</button>
+                    <!-- P0-10：音频采集默认关闭，需用户显式勾选才请求麦克风 -->
+                    <label style="display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #94a3b8; cursor: pointer;">
+                        <input type="checkbox" id="micEnableCheckbox" onchange="onMicToggle()">
+                        开启麦克风语音检测（默认关闭）
+                    </label>
                     <div style="margin-left: auto; display: flex; gap: 8px;">
                         <button class="btn btn-voice" id="voiceBtn" onclick="toggleVoiceBroadcast()">🔊 语音播报</button>
                         <button class="btn btn-voice" id="asrBtn" onclick="toggleASR()">🎙️ 语音识别</button>
@@ -649,6 +676,14 @@
         let loginRole = 'student';
         let modelEnabled = false;
 
+        // ========== P0-9：统一 HTML 转义工具 ==========
+        // 所有来自后端或用户输入的文本（姓名、学号、班级、状态、建议等）拼接进 innerHTML 前必须经过 esc()
+        function esc(v) {
+            return String(v ?? '').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
         // ========== 页面切换 ==========
         function showPage(pageId) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -734,6 +769,21 @@
                 return;
             }
 
+            // P0-9：姓名/学号/班级字符白名单前端预校验（与后端保持一致）
+            const regPattern = /^[\u4e00-\u9fa5A-Za-z0-9_·\-\s]{1,32}$/;
+            if (!regPattern.test(name)) {
+                document.getElementById('registerError').textContent = '姓名仅支持中文、字母、数字、下划线、间隔号、连字符和空格，长度 1~32 位';
+                return;
+            }
+            if (student_no && !/^[\u4e00-\u9fa5A-Za-z0-9_·\-\s]{0,32}$/.test(student_no)) {
+                document.getElementById('registerError').textContent = '学号包含非法字符';
+                return;
+            }
+            if (class_name && !/^[\u4e00-\u9fa5A-Za-z0-9_·\-\s]{0,32}$/.test(class_name)) {
+                document.getElementById('registerError').textContent = '班级包含非法字符';
+                return;
+            }
+
             try {
                 const response = await fetch('/api/student/register', {
                     method: 'POST',
@@ -745,7 +795,10 @@
                     alert('注册成功，请登录');
                     showLogin();
                 } else {
-                    document.getElementById('registerError').textContent = data.detail || '注册失败';
+                    // 后端 422 校验失败时 detail 为数组，统一转成可读提示
+                    let msg = data.detail;
+                    if (Array.isArray(msg)) msg = '输入内容不符合要求：' + msg.map(m => m.msg || '').join('；');
+                    document.getElementById('registerError').textContent = msg || '注册失败';
                 }
             } catch (error) {
                 document.getElementById('registerError').textContent = '网络错误';
@@ -827,19 +880,19 @@
                 return `
                 <div class="student-item">
                     <div class="student-info">
-                        <div class="student-avatar">${s.name.charAt(0)}</div>
+                        <div class="student-avatar">${esc(s.name).charAt(0)}</div>
                         <div class="student-details">
-                            <h3>${s.name}</h3>
-                            <p>${s.student_no ? '学号: ' + s.student_no : ''} ${s.class_name ? '班级: ' + s.class_name : ''}</p>
+                            <h3>${esc(s.name)}</h3>
+                            <p>${s.student_no ? '学号: ' + esc(s.student_no) : ''} ${s.class_name ? '班级: ' + esc(s.class_name) : ''}</p>
                         </div>
                     </div>
                     <div class="student-status">
                         <div style="text-align: right;">
                             ${onlineStatus} ${liveScore}
-                            <div style="font-size: 1.2rem; font-weight: 700; color: ${scoreColor}; margin-top: 4px;">${scoreText}</div>
-                            ${timeText ? '<div style="font-size: 0.7rem; color: #64748b;">' + timeText + '</div>' : ''}
+                            <div style="font-size: 1.2rem; font-weight: 700; color: ${scoreColor}; margin-top: 4px;">${esc(scoreText)}</div>
+                            ${timeText ? '<div style="font-size: 0.7rem; color: #64748b;">' + esc(timeText) + '</div>' : ''}
                         </div>
-                        <button class="view-btn" onclick="viewStudentDetail(${s.id})">查看详情</button>
+                        <button class="view-btn" onclick="viewStudentDetail(${parseInt(s.id) || 0})">查看详情</button>
                     </div>
                 </div>`;
             }).join('');
@@ -884,18 +937,18 @@
                 const scoreColor = score >= 70 ? '#34d399' : score >= 40 ? '#fbbf24' : '#f87171';
                 return `
                 <div class="record-item">
-                    <div class="record-time">📅 ${new Date(r.created_at).toLocaleString('zh-CN')}</div>
+                    <div class="record-time">📅 ${esc(new Date(r.created_at).toLocaleString('zh-CN'))}</div>
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div class="record-score" style="color: ${scoreColor};">专注度: ${score}%</div>
-                        <div style="font-size: 0.8rem; color: #94a3b8;">分心次数: ${r.distraction_count || 0}</div>
+                        <div class="record-score" style="color: ${scoreColor};">专注度: ${parseInt(score) || 0}%</div>
+                        <div style="font-size: 0.8rem; color: #94a3b8;">分心次数: ${parseInt(r.distraction_count) || 0}</div>
                     </div>
                     <div class="record-metrics">
-                        <span class="record-metric">头部: ${r.head_pose || '--'}</span>
-                        <span class="record-metric">身体: ${r.body_stability || '--'}</span>
-                        <span class="record-metric">疲劳: ${r.fatigue_level || '--'}</span>
-                        <span class="record-metric">眼神: ${r.eye_focus || '--'}</span>
+                        <span class="record-metric">头部: ${esc(r.head_pose || '--')}</span>
+                        <span class="record-metric">身体: ${esc(r.body_stability || '--')}</span>
+                        <span class="record-metric">疲劳: ${esc(r.fatigue_level || '--')}</span>
+                        <span class="record-metric">眼神: ${esc(r.eye_focus || '--')}</span>
                     </div>
-                    ${r.suggestion ? '<div style="margin-top: 6px; font-size: 0.8rem; color: #c4b5fd;">' + r.suggestion + '</div>' : ''}
+                    ${r.suggestion ? '<div style="margin-top: 6px; font-size: 0.8rem; color: #c4b5fd;">' + esc(r.suggestion) + '</div>' : ''}
                 </div>`;
             }).join('');
         }
@@ -989,8 +1042,69 @@
         function showStudentMonitor() {
             showPage('studentMonitorPage');
             document.getElementById('studentGreeting').textContent = `👨‍🎓 ${currentUser.name || currentUser.username}`;
+            // P0-10：未完成隐私告知同意前，绝不请求摄像头 / 麦克风
+            if (!hasPrivacyConsent()) {
+                showPrivacyConsent();
+                return;
+            }
             initMonitor();
 
+        }
+
+        // ========== P0-10：隐私告知与知情同意 ==========
+        function privacyConsentKey() {
+            return `privacyAgreed_${(currentUser && (currentUser.student_id || currentUser.username)) || 'guest'}`;
+        }
+
+        function hasPrivacyConsent() {
+            return localStorage.getItem(privacyConsentKey()) === '1';
+        }
+
+        function showPrivacyConsent() {
+            const mask = document.getElementById('privacyConsentMask');
+            mask.style.display = 'flex';
+            document.getElementById('connectionText').innerText = '待确认隐私告知';
+        }
+
+        function confirmPrivacyConsent() {
+            const box = document.getElementById('privacyConsentCheckbox');
+            // 未勾选同意时直接提示并阻止启动摄像头（不调用 getUserMedia）
+            if (!box || !box.checked) {
+                alert('请先勾选「我已阅读并理解上述告知内容」，否则无法开启监控。');
+                return;
+            }
+            localStorage.setItem(privacyConsentKey(), '1');
+            document.getElementById('privacyConsentMask').style.display = 'none';
+            initMonitor();
+        }
+
+        function declinePrivacyConsent() {
+            document.getElementById('privacyConsentMask').style.display = 'none';
+            stopCamera();
+            showLogin();
+        }
+
+        // ========== P0-10：删除本人数据 ==========
+        async function deleteMyData() {
+            if (!confirm('确定要删除你的全部行为记录与实时缓存吗？删除后不可恢复。')) return;
+            try {
+                const response = await apiRequest('/api/student/my-data', { method: 'DELETE' });
+                if (!response) return;
+                const data = await response.json();
+                if (!response.ok) {
+                    alert(data.detail || '删除失败，请稍后重试');
+                    return;
+                }
+                // 清空本地状态：停止采集、清空最近行为数据与提醒记录
+                stopCamera();
+                lastBehaviorData = null;
+                distractCount = 0;
+                reminderHistory = [];
+                alert(`已删除本人数据，共清理 ${data.deleted_records || 0} 条行为记录`);
+                location.reload();
+            } catch (e) {
+                alert('删除失败：' + e.message);
+            }
         }
 
 
@@ -1052,9 +1166,12 @@
 
         async function initCamera() {
             try {
+                // P0-10：音频采集默认关闭，仅在用户显式勾选“开启麦克风语音检测”时才请求麦克风
+                const micBox = document.getElementById('micEnableCheckbox');
+                const wantAudio = !!(micBox && micBox.checked);
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-                    audio: true
+                    audio: wantAudio
                 });
                 videoElement = document.getElementById('video');
                 videoElement.srcObject = mediaStream;
@@ -1062,6 +1179,31 @@
             } catch(e) {
                 console.error('❌ 摄像头/麦克风错误:', e);
                 document.getElementById('connectionText').innerText = '设备未授权';
+            }
+        }
+
+        // P0-10：麦克风开关 —— 只有用户主动勾选时才请求音频流；取消勾选则立即停止音频轨道
+        async function onMicToggle() {
+            const box = document.getElementById('micEnableCheckbox');
+            if (!box) return;
+            if (box.checked) {
+                try {
+                    const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    if (mediaStream) {
+                        audioStream.getAudioTracks().forEach(t => mediaStream.addTrack(t));
+                    } else {
+                        audioStream.getAudioTracks().forEach(t => t.stop());
+                    }
+                } catch (e) {
+                    box.checked = false;
+                    alert('麦克风授权失败：' + e.message);
+                }
+            } else {
+                // 关闭开关：停止语音识别并释放音频轨道
+                if (asrEnabled) toggleASR();
+                if (mediaStream) {
+                    mediaStream.getAudioTracks().forEach(t => { t.stop(); mediaStream.removeTrack(t); });
+                }
             }
         }
 
@@ -1153,6 +1295,13 @@
         }
         function toggleASR() {
             if (!recognition) return;
+            // P0-10：未开启麦克风开关时，不启动语音识别（语音识别需要音频流）
+            const micBox = document.getElementById('micEnableCheckbox');
+            if (!asrEnabled && micBox && !micBox.checked) {
+                addReminder('请先勾选「开启麦克风语音检测」再使用语音识别', 'system');
+                alert('语音识别需要麦克风权限，请先勾选「开启麦克风语音检测」。');
+                return;
+            }
             asrEnabled = !asrEnabled;
             const btn = document.getElementById('asrBtn'), st = document.getElementById('voiceStatus');
             if (asrEnabled) { recognition.start(); btn.innerHTML = '🎙️ 识别中'; btn.classList.add('active'); st.style.display = 'flex'; }
@@ -1243,7 +1392,7 @@
             reminderHistory.push({ text, type, time: Date.now() });
             const c = document.getElementById('reminderHistory');
             const colors = { 'auto': '#fbbf24', 'system': '#a855f7', 'encourage': '#34d399', 'info': '#22d3ee' };
-            c.innerHTML = reminderHistory.slice(-5).reverse().map(r => `<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05); color:${colors[r.type]||'#94a3b8'};">[${new Date(r.time).toLocaleTimeString()}] ${r.text}</div>`).join('');
+            c.innerHTML = reminderHistory.slice(-5).reverse().map(r => `<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05); color:${colors[r.type]||'#94a3b8'};">[${esc(new Date(r.time).toLocaleTimeString())}] ${esc(r.text)}</div>`).join('');
         }
         function sendEncouragement() {
             const msgs = ['💪 你做得很好，继续保持！','🌟 专注的你最棒！','🎯 目标就在前方，加油！','📚 每一分钟的努力都有意义','✨ 你已经很棒了，再坚持一下','🔥 你的坚持终将美好！'];
