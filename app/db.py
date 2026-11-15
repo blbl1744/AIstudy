@@ -21,7 +21,8 @@ def _hash_password(password: str) -> str:
 
 
 # ========== 数据库初始化 ==========
-DB_FILE = os.path.join(BASE_DIR, "ai_study_buddy.db")
+# P3-4：支持环境变量 AI_STUDY_DB 覆盖数据库文件路径（容器挂载卷 / 自动化测试隔离必需）
+DB_FILE = (os.getenv("AI_STUDY_DB") or "").strip() or os.path.join(BASE_DIR, "ai_study_buddy.db")
 
 def init_db():
     """初始化数据库（建表 / 历史表迁移 / 索引创建 / 留存清理 / 管理员初始化）"""

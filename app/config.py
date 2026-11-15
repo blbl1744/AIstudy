@@ -27,7 +27,11 @@ LOG_FILE = os.path.join(LOG_DIR, "app.log")
 logger = logging.getLogger("aistudy")
 # 仅在尚未挂载处理器时初始化，避免 uvicorn --reload 或多进程重复 import 导致日志重复写入
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    # P3-4：日志级别支持环境变量 AI_STUDY_LOG_LEVEL 覆盖（容器化部署便于统一调级），
+    # 非法取值一律回落 INFO，绝不因配置写错导致服务启动失败。
+    _LOG_LEVEL_NAME = (os.getenv("AI_STUDY_LOG_LEVEL") or "INFO").strip().upper()
+    _LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, None)
+    logger.setLevel(_LOG_LEVEL if isinstance(_LOG_LEVEL, int) else logging.INFO)
     _LOG_FORMAT = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(module)s:%(lineno)d | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",

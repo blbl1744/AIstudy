@@ -1,0 +1,45 @@
+# 构建上下文排除清单（减小镜像体积 + 防止密钥/数据/本地缓存进入镜像）
+
+# 版本控制与 IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存与测试缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 数据库文件（含 WAL/SHM 旁路文件）
+*.db
+*.db*
+*.sqlite
+*.sqlite3
+
+# 日志与本地临时目录
+logs/
+temp/
+*.log
+
+# 测试代码（生产镜像不需要）
+tests/
+
+# 环境变量文件（密钥必须走运行时注入，禁止打进镜像）
+.env
+.env.*
+!.env.example
+
+# 文档与构建脚本
+docs/
+*.md
+!README.md
+Dockerfile
+.dockerignore
