@@ -1,0 +1,29 @@
+# AI 学习专注度分析系统 —— 运行时依赖声明
+# 环境：Python 3.12
+# 说明：统一使用「兼容版本下限」（>=）声明，便于在 3.12 环境安装最新兼容版本。
+# 安装：pip install -r requirements.txt
+
+# ---- Web 框架与 ASGI 服务 ----
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# ---- 视觉与姿态识别（摄像头专注度检测） ----
+mediapipe>=0.10.14
+opencv-python>=4.10.0
+
+# ---- 数值与机器学习（专注度预测模型） ----
+numpy>=1.26.4
+scikit-learn>=1.5.2
+joblib>=1.4.2
+
+# ---- 认证与安全 ----
+PyJWT>=2.9.0
+bcrypt>=4.2.0
+
+# ---- HTTP 客户端（调用第三方 ASR / TTS 服务） ----
+requests>=2.32.3
+
+# ---- 测试 ----
+pytest>=8.3.0
+httpx>=0.27.0
