@@ -116,17 +116,18 @@ class TTLCache:
 
 # ========== P2-3：后台缓存清理协程 ==========
 async def _cache_janitor():
-    """每 60 秒清理一次三个内存缓存中的过期条目（防 OOM）"""
+    """每 60 秒清理一次内存缓存中的过期条目（防 OOM），含扩展二的分心预警状态"""
     while True:
         try:
             await asyncio.sleep(60)
             purged_video = student_video_cache.cleanup()
             purged_online = online_students.cleanup()
             purged_notice = student_notifications.cleanup()
-            if purged_video or purged_online or purged_notice:
+            purged_alert = student_alert_state.cleanup()
+            if purged_video or purged_online or purged_notice or purged_alert:
                 logger.info(
-                    "[缓存清理] 过期回收：视频帧 %s 条 / 在线状态 %s 条 / 提醒 %s 条",
-                    purged_video, purged_online, purged_notice,
+                    "[缓存清理] 过期回收：视频帧 %s 条 / 在线状态 %s 条 / 提醒 %s 条 / 预警状态 %s 条",
+                    purged_video, purged_online, purged_notice, purged_alert,
                 )
         except asyncio.CancelledError:
             # 生命周期结束时被 cancel，正常退出
@@ -150,6 +151,9 @@ student_video_cache = TTLCache(maxsize=200, ttl=10)
 student_notifications = TTLCache(maxsize=1000, ttl=300)
 # 在线学生状态：60 秒无心跳视为离线
 online_students = TTLCache(maxsize=500, ttl=60)
+# 扩展二：持续分心自动预警状态（连续分心时长 / 上次提醒时间 / 是否预警中 / 预警原因）
+# 5 分钟无更新自动回收，容量上限 500，避免学生长期离线后状态无限堆积
+student_alert_state = TTLCache(maxsize=500, ttl=300)
 
 def update_student_video_cache(student_id: int, annotated_image: str, focus_score: int,
                                  action_label="unknown", head_pose="", eye_focus="", fatigue_level="",

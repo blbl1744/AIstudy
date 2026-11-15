@@ -347,3 +347,142 @@ def test_teacher_notify_flow(client):
     resp = client.post(notify_url, json={"message": "请坐好", "level": "critical"}, headers=teacher["headers"])
     assert resp.status_code == 422, f"level 只允许 info/warning，实际 {resp.status_code}"
 
+
+
+# ========== 8. 持续分心自动预警（feat/extensions 扩展二）==========
+def test_auto_distraction_alert(client, monkeypatch):
+    """连续分心自动预警引擎：状态累积、自动温和提醒、冷却防刷屏、恢复后自动解除
+
+    断言四件事：
+    1. 连续多帧「未检测到人体」累计超过 AUTO_ALERT_SECONDS → 教师端看到 is_alerting=True
+       且原因正确，同时 student_notifications 自动收到一条 from_teacher="智能督学助手" 的提醒；
+    2. 冷却期内继续分心不重复下发提醒（提醒内容与 last_alert_ts 均保持不变）；
+    3. 恢复高分专注帧后 is_alerting 自动解除为 False、原因清空、连续分心时长归零；
+    4. 冷却期结束后再次持续「低头/分心」可产生新提醒，且原因切换为「持续低头/分心」。
+
+    实现说明：真实阈值 15 秒，用例不可能真的等 15 秒，因此把 student_routes 模块内的
+    AUTO_ALERT_SECONDS 缩小为 3 秒，并注入可控时钟（_now_ts）让每帧稳定前进 1 秒。
+    """
+    import app.routers.student_routes as student_routes_module
+
+    student = _register_and_login_student(client, "stu_alert", "学生戊")
+    teacher = _register_and_login_teacher(client, "tea_alert")
+    student_id = student["student_id"]
+
+    # 阈值 3 秒、冷却 60 秒（均用 monkeypatch 限定在用例内，不污染其他用例）
+    monkeypatch.setattr(student_routes_module, "AUTO_ALERT_SECONDS", 3)
+    monkeypatch.setattr(student_routes_module, "AUTO_ALERT_COOLDOWN", 60)
+
+    # 可控时钟：每次取时间前进 1 秒（小于单帧 3 秒截断上限，累加行为可预测）
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(student_routes_module, "_now_ts", lambda: clock["now"])
+
+    # 可控推理结果：score=None 表示未检测到人体（离座），88 表示端正坐姿
+    control = {"score": None}
+
+    def _fake_analyze(image_base64, scene="selfstudy", student_id=None):
+        """替身推理：按 control 返回指定分数，跳过真实视觉推理"""
+        score = control["score"]
+        return {
+            "focus_score": score,
+            "action_label": "离开" if score is None else "学习",
+            "annotated_image": "ZmFrZS1mcmFtZQ==",
+            "head_pose": "未检测" if score is None else "端正",
+            "eye_focus": "未检测",
+            "fatigue_level": "未检测",
+        }
+
+    from app.analyzer import analyzer as analyzer_instance
+
+    monkeypatch.setattr(analyzer_instance, "analyze", _fake_analyze)
+
+    def _send_frame(websocket, scene="selfstudy"):
+        """推进 1 秒虚拟时钟并发送一帧，返回推理结果（背压丢弃帧视为失败）"""
+        clock["now"] += 1.0
+        websocket.send_json({"image": "ZmFrZQ==", "scene": scene})
+        payload = websocket.receive_json()
+        assert not payload.get("skipped"), "正常节奏下不应触发背压丢帧"
+        return payload
+
+    def _teacher_row():
+        """从教师端学生列表取出本用例学生的那一行"""
+        resp = client.get("/api/teacher/students", headers=teacher["headers"])
+        assert resp.status_code == 200, resp.text
+        rows = [s for s in resp.json()["students"] if s["id"] == student_id]
+        assert rows, "教师端学生列表必须包含本用例注册的学生"
+        return rows[0]
+
+    # 8.0 初始态：从未分心 → 未预警
+    assert _teacher_row()["is_alerting"] is False
+    assert state_module.student_alert_state.get(student_id) is None
+
+    with client.websocket_connect(
+        f"/ws?token={student['token']}", headers={"origin": VALID_ORIGIN}
+    ) as websocket:
+        # 8.1 连续 4 帧离座：前 3 帧只累积不打扰，第 4 帧累计 3 秒达到阈值并自动提醒
+        #     （首帧时间差为 0，故需要 4 帧才能凑满 3 秒）
+        for _ in range(3):
+            _send_frame(websocket)
+        assert state_module.student_notifications.get(student_id) is None, "未达阈值前不得打扰学生"
+        assert _teacher_row()["is_alerting"] is False
+
+        _send_frame(websocket)
+        alert_state = state_module.student_alert_state.get(student_id)
+        assert alert_state is not None, "达到阈值后必须写入预警状态"
+        assert alert_state["is_alerting"] is True
+        assert alert_state["alert_reason"] == "连续离开座位"
+        assert alert_state["distracted_streak_sec"] >= 3
+
+        # 8.2 教师端透出预警状态与原因，供前端高亮
+        row = _teacher_row()
+        assert row["is_alerting"] is True, "教师端学生列表必须透出 is_alerting=True"
+        assert row["alert_reason"] == "连续离开座位"
+
+        # 8.3 学生收到一条自动温和提醒（走与教师手动提醒相同的通道与字段）
+        notification = state_module.student_notifications.get(student_id)
+        assert notification is not None, "达到阈值必须自动下发提醒"
+        assert notification["from_teacher"] == "智能督学助手"
+        assert notification["level"] == "warning"
+        assert notification["created_at"].endswith("Z"), (
+            f"自动提醒时间应为 UTC ISO-8601：{notification['created_at']}"
+        )
+        assert "连续离开座位" in notification["message"]
+        first_alert_ts = alert_state["last_alert_ts"]
+        first_created_at = notification["created_at"]
+
+        # 8.4 冷却期内继续分心：状态仍为预警中，但绝不重复下发（不覆盖、不刷新时间）
+        for _ in range(3):
+            _send_frame(websocket)
+        repeat = state_module.student_notifications.get(student_id)
+        assert repeat is not None
+        assert repeat["created_at"] == first_created_at, "冷却期内不得重复下发提醒"
+        assert state_module.student_alert_state.get(student_id)["last_alert_ts"] == first_alert_ts
+
+        # 8.5 恢复端正坐姿（高分帧）：预警立即解除，连续分心时长归零
+        control["score"] = 88
+        _send_frame(websocket)
+        recovered = state_module.student_alert_state.get(student_id)
+        assert recovered["is_alerting"] is False, "高分帧必须立即解除预警"
+        assert recovered["alert_reason"] == ""
+        assert recovered["distracted_streak_sec"] == 0.0
+        row = _teacher_row()
+        assert row["is_alerting"] is False
+        assert row["alert_reason"] == ""
+
+        # 8.6 冷却期结束后再次持续「低头/分心」：可产生新提醒，且原因切换为「持续低头/分心」
+        #     先把上一条提醒取走（模拟学生端已消费），否则「存在未读提醒」会抑制新提醒
+        state_module.student_notifications.pop(student_id, None)
+        clock["now"] += 120.0  # 越过 60 秒冷却
+        control["score"] = 30  # 有分数但低于 mild(60) → 低头/分心
+        for _ in range(3):
+            _send_frame(websocket)
+        new_alert = state_module.student_notifications.get(student_id)
+        assert new_alert is not None, "冷却期结束后应能再次自动提醒"
+        assert new_alert["from_teacher"] == "智能督学助手"
+        assert "持续低头/分心" in new_alert["message"]
+        assert state_module.student_alert_state.get(student_id)["alert_reason"] == "持续低头/分心"
+
+    # 8.7 学生删除本人数据时，预警状态一并清理（未成年人隐私合规最小集）
+    resp = client.delete("/api/student/my-data", headers=student["headers"])
+    assert resp.status_code == 200, resp.text
+    assert state_module.student_alert_state.get(student_id) is None, "删除个人数据必须同时清空预警状态"

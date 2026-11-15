@@ -185,7 +185,7 @@ os.environ.pop("AI_STUDY_ADMIN_PASSWORD", None)
 
 # ========== 3. 运行时状态清理工具 ==========
 def _reset_runtime_state() -> None:
-    """清理登录限速记录、三类内存缓存、在途推理标记与评分历史"""
+    """清理登录限速记录、四类内存缓存、在途推理标记与评分历史"""
     from app import auth as auth_module
     from app import state as state_module
     from app.analyzer import analyzer
@@ -193,7 +193,13 @@ def _reset_runtime_state() -> None:
     with auth_module._login_fail_lock:
         auth_module._login_fail.clear()
 
-    for cache in (state_module.student_video_cache, state_module.online_students, state_module.student_notifications):
+    for cache in (
+        state_module.student_video_cache,
+        state_module.online_students,
+        state_module.student_notifications,
+        # 扩展二：持续分心预警状态也必须逐用例清空，否则上个用例的预警会飘到下个用例
+        state_module.student_alert_state,
+    ):
         with cache._lock:
             cache._store.clear()
 

@@ -148,6 +148,12 @@ JWT_SECRET_KEY = _cfg("JWT_SECRET_KEY")
 JWT_ALGORITHM = _cfg("JWT_ALGORITHM")
 JWT_EXPIRE_DAYS = _cfg("JWT_EXPIRE_DAYS")
 
+# ========== feat/extensions 扩展二：持续分心自动预警参数（环境变量可覆盖） ==========
+# AI_STUDY_AUTO_ALERT_SECONDS：连续分心累计秒数达到该阈值即触发自动温和提醒（默认 15 秒）
+AUTO_ALERT_SECONDS = int(os.getenv("AI_STUDY_AUTO_ALERT_SECONDS", "15"))
+# AI_STUDY_AUTO_ALERT_COOLDOWN：同一学生两次自动提醒的最小间隔秒数（默认 60 秒），用于防刷屏
+AUTO_ALERT_COOLDOWN = int(os.getenv("AI_STUDY_AUTO_ALERT_COOLDOWN", "60"))
+
 
 # ========== P1-8：配置归一化（唯一真源原则） ==========
 # 说明：旧的四个标量配置项与 POSE_THRESHOLDS 存在语义重叠，这里统一以标量配置为准回灌到阈值字典，

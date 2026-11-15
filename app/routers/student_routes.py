@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import time
+from datetime import datetime, timezone
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -13,11 +14,14 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from ..analyzer import analyzer
 from ..auth import get_current_user, verify_jwt_token
 from ..config import (
+    AUTO_ALERT_COOLDOWN,
+    AUTO_ALERT_SECONDS,
     CORS_ALLOW_ORIGINS,
     VOLC_ACCESS_KEY,
     VOLC_ASR_ENDPOINT,
     VOLC_SECRET_KEY,
     VOLC_TOKEN_URL,
+    WARNING_LEVELS,
     logger,
 )
 from ..db import get_db, get_student_by_id, save_behavior_record
@@ -25,12 +29,91 @@ from ..state import (
     _INFER_POOL,
     _inflight_students,
     online_students,
+    student_alert_state,
     student_notifications,
     student_video_cache,
+    to_iso_utc,
     update_student_video_cache,
 )
 
 router = APIRouter()
+
+# ========== feat/extensions 扩展二：持续分心自动预警引擎 ==========
+# 单帧计时间隔上限：断线重连或页面切后台回来时，两帧之间的真实时间差可能达到几十秒，
+# 若直接累加会把「一次分心」误算成「连续分心很久」，因此单帧最多按 3 秒计。
+_MAX_FRAME_DELTA_SEC = 3.0
+
+
+def _now_ts() -> float:
+    """当前时间戳（抽成独立函数，便于测试注入可控时钟，避免用例真的等待十几秒）"""
+    return time.time()
+
+
+def _update_auto_alert_state(student_id: int, focus_score, now_ts: float) -> dict:
+    """根据最新一帧的专注度更新「持续分心」状态，必要时自动下发温和提醒
+
+    判定规则：
+    - 分心帧：focus_score 为 None（未检测到人体/离座）或低于 WARNING_LEVELS["mild"]（60）；
+    - 分心帧累加与上一帧的时间差（单帧上限 3 秒），专注帧则立刻清零并解除预警；
+    - 连续分心时长达到 AUTO_ALERT_SECONDS：置 is_alerting=True 并记录原因（供教师端高亮）；
+    - 自动提醒：距上次自动提醒超过 AUTO_ALERT_COOLDOWN 秒，且当前没有未读提醒时才下发，
+      既避免刷屏，也避免覆盖教师刚手动发出的提醒。
+    """
+    state = student_alert_state.get(student_id) or {
+        "distracted_streak_sec": 0.0,
+        "last_frame_ts": now_ts,
+        "last_alert_ts": 0.0,
+        "is_alerting": False,
+        "alert_reason": "",
+    }
+
+    last_frame_ts = state.get("last_frame_ts") or now_ts
+    # 时间差做上下截断：上界防跳变误判，下界防同一时间戳或时钟回拨产生负数
+    delta = min(max(now_ts - last_frame_ts, 0.0), _MAX_FRAME_DELTA_SEC)
+    state["last_frame_ts"] = now_ts
+
+    # 未检测到人体（None）或分数低于温和线，均记为分心帧
+    is_distracted = focus_score is None or focus_score < WARNING_LEVELS["mild"]
+
+    if not is_distracted:
+        # 恢复端正坐姿/专注状态：连续分心清零，预警立即解除
+        state["distracted_streak_sec"] = 0.0
+        state["is_alerting"] = False
+        state["alert_reason"] = ""
+        student_alert_state.set(student_id, state)
+        return state
+
+    streak = float(state.get("distracted_streak_sec") or 0.0) + delta
+    state["distracted_streak_sec"] = round(streak, 3)
+
+    if streak < AUTO_ALERT_SECONDS:
+        # 尚未达到阈值：只累积时长，不打扰学生
+        student_alert_state.set(student_id, state)
+        return state
+
+    # 达到阈值：标记预警中，并区分「离座」与「在座但低头/分心」两类原因
+    reason = "连续离开座位" if focus_score is None else "持续低头/分心"
+    state["is_alerting"] = True
+    state["alert_reason"] = reason
+
+    cooldown_elapsed = now_ts - float(state.get("last_alert_ts") or 0.0) >= AUTO_ALERT_COOLDOWN
+    has_unread = student_notifications.get(student_id) is not None
+    if cooldown_elapsed and not has_unread:
+        # 温和提醒：只提示、不批评，文案与教师手动提醒共用同一渲染通道
+        student_notifications.set(student_id, {
+            "message": f"已经{reason}超过 {AUTO_ALERT_SECONDS} 秒啦，先坐正、深呼吸一下，我们继续加油～",
+            "level": "warning",
+            "from_teacher": "智能督学助手",
+            "created_at": to_iso_utc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+        })
+        state["last_alert_ts"] = now_ts
+        logger.info(
+            "自动预警已下发：student_id=%s，原因=%s，连续分心=%s 秒（阈值 %s 秒，冷却 %s 秒）",
+            student_id, reason, round(streak, 1), AUTO_ALERT_SECONDS, AUTO_ALERT_COOLDOWN,
+        )
+
+    student_alert_state.set(student_id, state)
+    return state
 
 # --- 学生保存自己的行为数据 ---
 @router.post("/api/student/behavior")
@@ -171,6 +254,10 @@ async def ws_endpoint(websocket: WebSocket):
                     # 否则该学生后续帧会被永久丢弃。
                     _inflight_students.discard(student_id)
 
+                # ===== 扩展二：每帧推理后更新持续分心状态（教师端状态、自动提醒都在此产生）=====
+                # 放在缓存更新之前，保证教师端拉列表时看到的是本帧判定后的最新预警状态。
+                _update_auto_alert_state(student_id, result.get("focus_score"), _now_ts())
+
                 # 缓存学生视频帧（供教师实时查看）
                 if student_id and result.get("annotated_image"):
                     update_student_video_cache(
@@ -246,10 +333,11 @@ async def delete_my_student_data(user: dict = Depends(get_current_user)):
         cursor.execute("DELETE FROM behavior_records WHERE student_id = ?", (student_id,))
         deleted_records = cursor.rowcount or 0
 
-    # 2) 清理内存缓存：实时画面、在线状态、待推送提醒
+    # 2) 清理内存缓存：实时画面、在线状态、待推送提醒、持续分心预警状态
     student_video_cache.pop(student_id, None)
     online_students.pop(student_id, None)
     student_notifications.pop(student_id, None)
+    student_alert_state.pop(student_id, None)
 
     logger.info("学生 %s 已删除本人数据，共 %s 条行为记录", student_id, deleted_records)
     return {

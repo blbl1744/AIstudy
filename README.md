@@ -2,7 +2,8 @@
 
 基于摄像头画面的**课堂/自习专注度分析系统**：学生端浏览器采集画面帧，服务端用 MediaPipe 提取
 33 点姿态关键点，结合几何规则引擎（可选叠加已训练的回归模型）输出专注度分数、姿态状态、
-视线状态与疲劳等级；教师端可查看学生列表、历史行为记录与实时画面，并对低专注学生下发提醒。
+视线状态与疲劳等级；教师端可查看学生列表、历史行为记录与实时画面，并对低专注学生下发提醒；
+连续分心超阈值时由系统自动下发温和提醒，并在教师端高亮该学生卡片。
 
 - 技术栈：FastAPI + Uvicorn + SQLite（WAL）+ MediaPipe/OpenCV + NumPy/scikit-learn + JWT(bcrypt)
 - 运行形态：单进程 ASGI 服务（默认端口 `8001`），支持 Docker 部署，前置 Nginx 做 HTTPS/WSS 终结
@@ -49,7 +50,7 @@ main ──► routers ──► analyzer ──► model_loader ──► state
 
 ## 二、环境变量配置表
 
-所有配置项均以 `AI_STUDY_` 为前缀，命名与根目录 [`.env.example`](.env.example) **完全一致**（共 9 项）。
+所有配置项均以 `AI_STUDY_` 为前缀，命名与根目录 [`.env.example`](.env.example) **完全一致**（共 11 项）。
 本地开发可复制 `.env.example` 为 `.env`；容器部署通过 `-e` / `--env-file` 注入，**严禁把 `.env` 打进镜像**。
 
 | 环境变量 | 必填 | 默认值 | 说明 |
@@ -63,6 +64,8 @@ main ──► routers ──► analyzer ──► model_loader ──► state
 | `AI_STUDY_DEBUG_API` | 否 | 空（不注册） | `1`=注册 `/api/debug/*` 诊断接口（仅教师可用）；**生产必须保持为空或 `0`** |
 | `AI_STUDY_DB` | 否 | 项目根目录 `ai_study_buddy.db` | SQLite 数据库文件路径。容器部署建议指向挂载卷，如 `/data/ai_study_buddy.db` |
 | `AI_STUDY_LOG_LEVEL` | 否 | `INFO` | 日志级别：`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`；非法取值自动回落 `INFO` |
+| `AI_STUDY_AUTO_ALERT_SECONDS` | 否 | `15` | 持续分心自动预警阈值：连续分心（未检测到人体或专注度 < 60）累计达到该秒数即触发一次温和提醒（`feat/extensions` 扩展二） |
+| `AI_STUDY_AUTO_ALERT_COOLDOWN` | 否 | `60` | 自动提醒冷却时间：同一学生两次自动提醒的最小间隔秒数，冷却期内持续分心也不会重复下发，防止刷屏 |
 
 > 说明：`AI_STUDY_DB` 与 `AI_STUDY_LOG_LEVEL` 在 P3-4 收尾时补齐为真实生效的配置项
 > （此前 README 约定但代码未读取，属「文档承诺未落地」缺口），便于容器挂卷与统一调级，行为默认值与原实现完全一致。
@@ -203,7 +206,7 @@ server {
 1. **知情同意**：学生账号须由监护人与学校知情同意后开通；学生端页面明确展示采集范围（画面帧仅用于本地推理展示，服务端只落专注度等结构化指标）。
 2. **默认关闭音频**：语音识别链路默认不启用（`ASR_CONFIG.enable_volcengine`/`enable_browser_asr` 需显式开启），系统默认只处理画面，不采集、不存储任何音频。
 3. **30 天自动清理**：每条行为记录写入时即生成 `expire_at`（写入时刻 + 30 天），启动期与后台 janitor 定期删除到期数据；`behavior_records(student_id, created_at)` 复合索引支撑按学生批量清理。
-4. **一键删除本人数据**：`DELETE /api/student/my-data` 由学生本人（令牌身份）触发，删除其全部行为记录并清理实时画面缓存、在线状态、待推送提醒；**身份只取自 JWT**，不接受外部传入 `student_id`，教师角色调用返回 `403`。
+4. **一键删除本人数据**：`DELETE /api/student/my-data` 由学生本人（令牌身份）触发，删除其全部行为记录并清理实时画面缓存、在线状态、待推送提醒与持续分心预警状态；**身份只取自 JWT**，不接受外部传入 `student_id`，教师角色调用返回 `403`。
 5. **越权与注入防护**：教师/学生接口按角色双向隔离；姓名等回显字段使用字符白名单（拒绝 `<script>` 等载荷，返回 `422`）；前端渲染统一 `esc()` 转义；登录失败限速防爆破。
 6. **不对外传输**：除显式启用的第三方语音服务外，画面帧不外发；`/healthz` 等对外响应脱敏，不含路径、密钥与堆栈。
 
@@ -218,9 +221,9 @@ python -m pytest tests -v
 ```
 
 - `tests/conftest.py`：在导入 `app` 之前为缺失的 `cv2` / `mediapipe` 注入轻量桩模块，使测试在**未安装视觉库的环境**也能直接运行；`client` 夹具用 `tmp_path` 隔离 `AI_STUDY_DB`、注入 ≥32 位 JWT 密钥与 CORS 白名单，并在用例前后清理登录限速与内存缓存（通过 `with TestClient(app)` 触发完整 lifespan）。
-- `tests/test_core.py`：6 组核心守护用例——13 维特征契约、规则分区间、WebSocket 握手鉴权（4401/4403 与伪造 `student_id` 不污染他人）、越权矩阵（403/404 + XSS 422）、迁移幂等（`expire_at` 列与 `idx_behavior_student_time` 索引）、时间格式（`Z` 结尾的 UTC ISO-8601）与 `/healthz`。
+- `tests/test_core.py`：8 组核心守护用例——13 维特征契约、规则分区间、WebSocket 握手鉴权（4401/4403 与伪造 `student_id` 不污染他人）、越权矩阵（403/404 + XSS 422）、迁移幂等（`expire_at` 列与 `idx_behavior_student_time` 索引）、时间格式（`Z` 结尾的 UTC ISO-8601）与 `/healthz`、教师督学提醒闭环（发送 → 学生轮询取走并销毁 → 参数校验 422）、持续分心自动预警（阈值触发、冷却防刷屏、恢复解除、删除数据清理）。
 
-当前结果：**6 passed**。
+当前结果：**8 passed**。
 
 ---
 

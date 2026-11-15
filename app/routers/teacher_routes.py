@@ -16,7 +16,13 @@ from ..db import (
     get_student_behavior_records,
     get_student_by_id,
 )
-from ..state import get_student_video_cache, student_notifications, student_video_cache, to_iso_utc
+from ..state import (
+    get_student_video_cache,
+    student_alert_state,
+    student_notifications,
+    student_video_cache,
+    to_iso_utc,
+)
 
 router = APIRouter()
 
@@ -40,6 +46,10 @@ async def teacher_list_students(user: dict = Depends(get_current_user)):
         else:
             s["online"] = False
             s["live_focus_score"] = None
+        # 扩展二：透出持续分心预警状态，前端据此高亮卡片，教师可优先点击干预
+        alert = student_alert_state.get(s["id"]) or {}
+        s["is_alerting"] = bool(alert.get("is_alerting"))
+        s["alert_reason"] = alert.get("alert_reason") or ""
     return {"students": students}
 
 # --- 教师查看某个学生的行为记录 ---
