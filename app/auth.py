@@ -8,12 +8,13 @@ import hmac
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import JWT_ALGORITHM, JWT_EXPIRE_DAYS, JWT_SECRET_KEY, logger
 from .db import get_db
@@ -156,3 +157,26 @@ class StudentRegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class TeacherNotifyRequest(BaseModel):
+    """教师端发送实时督学提醒的请求体（feat/extensions）
+
+    - message：必填，去除首尾空白后长度必须在 1~100 之间，纯空白串一律拒绝（422）；
+    - level：提醒级别，仅允许 info / warning，缺省为 warning（学生端据此决定播报语气）。
+    """
+
+    message: str = Field(..., min_length=1, max_length=100, description="提醒内容，1~100 字符")
+    level: Literal["info", "warning"] = Field(default="warning", description="提醒级别")
+
+    @field_validator("message")
+    @classmethod
+    def _strip_and_check_message(cls, v: str) -> str:
+        """去除首尾空白后再校验长度，杜绝「只发空格」的空提醒"""
+        text = (v or "").strip()
+        if not text:
+            raise ValueError("提醒内容不能为空白")
+        if len(text) > 100:
+            raise ValueError("提醒内容不得超过 100 个字符")
+        return text
+

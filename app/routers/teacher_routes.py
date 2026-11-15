@@ -1,13 +1,14 @@
 """
-路由层 · 教师端：学生列表、行为记录、实时状态、快照图片，以及受环境变量开关控制的调试接口。"""
+路由层 · 教师端：学生列表、行为记录、实时状态、快照图片、实时督学提醒，以及受环境变量开关控制的调试接口。"""
 import base64
 import os
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from ..auth import get_current_user
+from ..auth import TeacherNotifyRequest, get_current_user
 from ..config import logger
 from ..db import (
     get_all_students,
@@ -15,7 +16,7 @@ from ..db import (
     get_student_behavior_records,
     get_student_by_id,
 )
-from ..state import get_student_video_cache, student_video_cache
+from ..state import get_student_video_cache, student_notifications, student_video_cache, to_iso_utc
 
 router = APIRouter()
 
@@ -113,6 +114,48 @@ async def teacher_get_student_snapshot(student_id: int, user: dict = Depends(get
 
 
 # ========== 前端页面（已抽离至 templates/index.html） ==========
+
+# --- 教师向学生发送实时督学提醒（feat/extensions 通知闭环入口）---
+@router.post("/api/teacher/students/{student_id}/notify")
+async def teacher_notify_student(
+    student_id: int,
+    req: TeacherNotifyRequest,
+    user: dict = Depends(get_current_user),
+):
+    """教师端 → 学生端一次性提醒通道
+
+    设计要点：
+    - 鉴权：调用者必须是 teacher 角色（学生/未明确角色一律 403），身份只取自 JWT；
+    - 目标校验：学生必须真实存在，否则 404，避免向不存在的 id 堆积垃圾提醒；
+    - 存储：写入 state.student_notifications（TTLCache，5 分钟未被学生端取走则自动过期），
+      学生端轮询 GET /api/student/notifications 时「读取即销毁」，保证同一条提醒只播报一次；
+    - 审计：记录教师与目标学生，便于事后追溯谁在何时提醒了谁（不记录令牌等敏感信息）。
+    """
+    if user.get("role") != "teacher":
+        raise HTTPException(status_code=403, detail="仅教师可发送提醒")
+    student = get_student_by_id(student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    payload = {
+        "message": req.message,
+        "level": req.level,
+        "from_teacher": user.get("sub", "教师"),
+        # 统一 UTC + Z 后缀，前端按本地时区渲染，和 /healthz、行为记录的时间口径保持一致
+        "created_at": to_iso_utc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+    }
+    # key 用 int 型 student_id，与学生端 notification 读取逻辑（令牌 user_id 为 int）保持一致
+    student_notifications.set(student_id, payload)
+
+    logger.info(
+        "教师提醒已下发：teacher=%s → student_id=%s(%s)，level=%s，长度=%s",
+        user.get("sub", "教师"),
+        student_id,
+        student.get("name", ""),
+        req.level,
+        len(req.message),
+    )
+    return {"success": True, "message": "提醒已发送"}
 
 
 # 调试接口（P0-3）：默认不注册；仅当环境变量 AI_STUDY_DEBUG_API == "1" 时注册，且仅教师可访问

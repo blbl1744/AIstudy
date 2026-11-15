@@ -285,3 +285,65 @@ def test_time_iso_utc_and_healthz(client):
     # 实现中数据库探活字段名为 database（与任务描述的 db 同义），此处按真实契约断言
     assert body["database"] == "ok"
     assert body["model"]["feature_dim"] == 13
+
+
+# ========== 7. 教师督学提醒闭环（feat/extensions）==========
+def test_teacher_notify_flow(client):
+    """教师端发送提醒 → 学生端取走并播报的完整闭环
+
+    断言三件事：
+    1. 越权：学生调用发送接口必须 403（发送能力只属于教师）；
+    2. 目标校验：向不存在的学生发送必须 404，不得静默丢进缓存；
+    3. 端到端：教师发送 200 → 学生轮询拿到同一条 message/level/from_teacher → 再次轮询为空
+       （说明消费即销毁，同一条提醒不会被重复播报）。
+    """
+    student = _register_and_login_student(client, "stu_notify", "学生丁")
+    teacher = _register_and_login_teacher(client, "tea_notify")
+    student_id = student["student_id"]
+    notify_url = f"/api/teacher/students/{student_id}/notify"
+
+    # 7.1 学生调用发送接口 → 403
+    resp = client.post(notify_url, json={"message": "请保持坐姿端正"}, headers=student["headers"])
+    assert resp.status_code == 403, f"学生无权发送提醒，实际 {resp.status_code}"
+
+    # 7.2 教师向不存在的学生发送 → 404（用极大 id 规避自增冲突）
+    resp = client.post(
+        "/api/teacher/students/99999999/notify",
+        json={"message": "请保持坐姿端正"},
+        headers=teacher["headers"],
+    )
+    assert resp.status_code == 404, f"目标学生不存在应 404，实际 {resp.status_code}"
+
+    # 7.3 教师向合法学生发送 → 200
+    message = "注意集中注意力，放下无关物品"
+    resp = client.post(notify_url, json={"message": message, "level": "info"}, headers=teacher["headers"])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert body["message"] == "提醒已发送"
+
+    # 7.4 学生轮询：第一条就是刚发的那条提醒（字段完整、时间带 Z）
+    first = client.get("/api/student/notifications", headers=student["headers"])
+    assert first.status_code == 200, first.text
+    notification = first.json()["notification"]
+    assert notification is not None, "教师刚发送的提醒必须能被学生取到"
+    assert notification["message"] == message
+    assert notification["level"] == "info"
+    assert notification["from_teacher"], "必须带上发送者标识，学生端才能渲染「来自 X 老师」"
+    assert notification["created_at"].endswith("Z"), f"created_at 应为 UTC ISO-8601：{notification['created_at']}"
+
+    # 7.5 再次轮询 → None，确认「读取即销毁」，同一条提醒不会重复播报
+    second = client.get("/api/student/notifications", headers=student["headers"])
+    assert second.status_code == 200, second.text
+    assert second.json()["notification"] is None, "提醒只能被消费一次，重复轮询必须为空"
+
+    # 7.6 入参边界：纯空白内容与超长内容一律 422，且不得污染缓存
+    for bad_payload in ({"message": "   "}, {"message": "超" * 101}, {"message": ""}):
+        resp = client.post(notify_url, json=bad_payload, headers=teacher["headers"])
+        assert resp.status_code == 422, f"非法提醒内容应 422，实际 {resp.status_code}：{bad_payload}"
+        assert state_module.student_notifications.get(student_id) is None
+
+    # 7.7 级别非法值同样被结构校验拦截（Literal 白名单）
+    resp = client.post(notify_url, json={"message": "请坐好", "level": "critical"}, headers=teacher["headers"])
+    assert resp.status_code == 422, f"level 只允许 info/warning，实际 {resp.status_code}"
+

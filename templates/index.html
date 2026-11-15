@@ -499,6 +499,25 @@
                     </div>
                 </div>
             </div>
+            <!-- feat/extensions：实时督学提醒发送入口（教师 → 学生，学生端轮询后播报） -->
+            <div class="card full-width">
+                <div class="card-title">📢 发送督学提醒</div>
+                <div style="font-size: 0.82rem; color: #94a3b8; margin-bottom: 10px;">
+                    学生端每 3 秒轮询一次，收到后立即语音播报并在提醒记录中显示；同一条提醒只会被消费一次。
+                </div>
+                <div id="notifyQuickPhrases" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;"></div>
+                <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+                    <input type="text" id="notifyMessageInput" class="form-input" maxlength="100"
+                           placeholder="输入自定义提醒内容（1~100 字符）" style="flex: 1; min-width: 240px;"
+                           onkeydown="if (event.key === 'Enter') sendTeacherNotify()">
+                    <select id="notifyLevelSelect" class="form-input" style="width: 150px;">
+                        <option value="warning">⚠️ 强提醒</option>
+                        <option value="info">💡 轻提示</option>
+                    </select>
+                    <button class="btn btn-small" id="notifySendBtn" onclick="sendTeacherNotify()">发送提醒</button>
+                </div>
+                <div id="notifyFeedback" style="margin-top: 10px; font-size: 0.85rem; color: #94a3b8; min-height: 20px;"></div>
+            </div>
             <div class="card full-width">
                 <div class="card-title">📊 行为记录</div>
                 <div id="detailRecords" class="record-list">
@@ -893,6 +912,7 @@
                             ${timeText ? '<div style="font-size: 0.7rem; color: #64748b;">' + esc(timeText) + '</div>' : ''}
                         </div>
                         <button class="view-btn" onclick="viewStudentDetail(${parseInt(s.id) || 0})">查看详情</button>
+                        <button class="btn btn-outline btn-small" onclick="openNotifyFor(${parseInt(s.id) || 0})">发送提醒</button>
                     </div>
                 </div>`;
             }).join('');
@@ -915,6 +935,12 @@
             document.getElementById('detailName').textContent = student.name;
             document.getElementById('detailMeta').textContent =
                 `${student.student_no ? '学号: ' + student.student_no : ''} ${student.class_name ? '班级: ' + student.class_name : ''} | 注册时间: ${new Date(student.created_at).toLocaleString('zh-CN')}`;
+
+            // feat/extensions：进入详情页时初始化提醒发送区（快捷话术 + 清空上一次的残留状态）
+            renderNotifyQuickPhrases();
+            const notifyInput = document.getElementById('notifyMessageInput');
+            if (notifyInput) notifyInput.value = '';
+            setNotifyFeedback('', '#94a3b8');
 
             refreshStudentLive();
             if (document.getElementById('autoRefreshLive').checked) {
@@ -1031,6 +1057,105 @@
             stopAutoRefresh();
             currentViewingStudentId = null;
             showTeacherStudentList();
+        }
+
+        // 学生列表卡片的「发送提醒」快捷入口：先进入详情页，再把光标定位到提醒输入框
+        async function openNotifyFor(studentId) {
+            await viewStudentDetail(studentId);
+            const input = document.getElementById('notifyMessageInput');
+            if (input) {
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                input.focus();
+            }
+        }
+
+        // ========== feat/extensions：教师端发送实时督学提醒 ==========
+        const NOTIFY_QUICK_PHRASES = [
+            '请保持坐姿端正',
+            '注意集中注意力，放下无关物品',
+            '抬头看屏幕，注意用眼距离',
+            '累了就休息两分钟，保护好眼睛',
+            '状态不错，继续保持'
+        ];
+        let notifySending = false;
+
+        // 快捷话术按钮用「下标」绑定点击事件，绝不把话术文本拼进 onclick，避免二次注入
+        function renderNotifyQuickPhrases() {
+            const box = document.getElementById('notifyQuickPhrases');
+            if (!box) return;
+            box.innerHTML = NOTIFY_QUICK_PHRASES.map((p, i) =>
+                `<button class="btn btn-outline btn-small" onclick="pickNotifyPhrase(${i})">${esc(p)}</button>`
+            ).join('');
+        }
+
+        function pickNotifyPhrase(index) {
+            const phrase = NOTIFY_QUICK_PHRASES[index];
+            if (!phrase) return;
+            const input = document.getElementById('notifyMessageInput');
+            if (!input) return;
+            input.value = phrase;
+            input.focus();
+            setNotifyFeedback('已填入快捷话术，可直接发送或继续修改', '#94a3b8');
+        }
+
+        // 反馈区一律用 textContent 写入，服务端返回的错误详情也按纯文本处理
+        function setNotifyFeedback(text, color) {
+            const el = document.getElementById('notifyFeedback');
+            if (!el) return;
+            el.textContent = text;
+            el.style.color = color || '#94a3b8';
+        }
+
+        async function sendTeacherNotify() {
+            if (!currentViewingStudentId) {
+                setNotifyFeedback('请先从学生列表进入某个学生的详情页', '#f87171');
+                return;
+            }
+            if (notifySending) return;
+
+            const input = document.getElementById('notifyMessageInput');
+            const levelEl = document.getElementById('notifyLevelSelect');
+            const btn = document.getElementById('notifySendBtn');
+            const message = (input ? input.value : '').trim();
+            const level = levelEl ? levelEl.value : 'warning';
+
+            // 前端先做一次与后端一致的长度校验，减少无效请求；后端仍会再校验一遍
+            if (!message) {
+                setNotifyFeedback('请先选择快捷话术或输入提醒内容', '#f87171');
+                return;
+            }
+            if (message.length > 100) {
+                setNotifyFeedback('提醒内容不能超过 100 个字符', '#f87171');
+                return;
+            }
+
+            notifySending = true;
+            if (btn) btn.disabled = true;
+            setNotifyFeedback('正在发送…', '#94a3b8');
+            try {
+                const resp = await apiRequest(`/api/teacher/students/${currentViewingStudentId}/notify`, {
+                    method: 'POST',
+                    body: JSON.stringify({ message, level })
+                });
+                if (!resp) return; // 401 已由 apiRequest 统一处理（自动登出）
+                if (resp.ok) {
+                    setNotifyFeedback(`提醒已发送，学生端将在 3 秒内收到并播报（${level === 'info' ? '轻提示' : '强提醒'}）`, '#34d399');
+                } else if (resp.status === 404) {
+                    setNotifyFeedback('该学生不存在或已被删除，无法发送', '#f87171');
+                } else if (resp.status === 422) {
+                    setNotifyFeedback('提醒内容不合法（需 1~100 字且不能全为空白）', '#f87171');
+                } else if (resp.status === 403) {
+                    setNotifyFeedback('当前账号不是教师身份，无权发送提醒', '#f87171');
+                } else {
+                    setNotifyFeedback(`发送失败（HTTP ${resp.status}），请稍后重试`, '#f87171');
+                }
+            } catch (e) {
+                console.error('发送督学提醒失败:', e);
+                setNotifyFeedback('网络异常，提醒未发送成功', '#f87171');
+            } finally {
+                notifySending = false;
+                if (btn) btn.disabled = false;
+            }
         }
 
         // ========== 学生端：监控页面 ==========
@@ -1157,12 +1282,27 @@
                 });
                 const data = await resp.json();
                 if (data.success && data.notification) {
-                    const msg = data.notification.message;
-                    addReminder('📢 ' + msg, 'encourage');
-                    speak(msg);
-                    showSpeechToast(msg);
+                    showTeacherNotification(data.notification);
                 }
             } catch(e) { console.error('获取提醒失败:', e); }
+        }
+
+        // ========== feat/extensions：教师实时督学提醒的展示与播报 ==========
+        // P0-9 安全约束持续有效：notification.message / notification.from_teacher 都是教师端
+        // 自由输入的文本（不可信），必须先各自经过 esc() 转义，才能拼进 innerHTML；
+        // 语音播报（speak）与浮层（showSpeechToast 用 textContent 写入）不涉及 HTML 解析，天然安全。
+        function showTeacherNotification(notification) {
+            const rawMessage = String(notification.message ?? '');
+            const rawFrom = String(notification.from_teacher ?? '教师');
+            const isInfo = notification.level === 'info';
+            const headIcon = isInfo ? '💡' : '⚠️';
+            const safeMessage = esc(rawMessage);
+            const safeFrom = esc(rawFrom);
+            // 第三个参数 true 表示文本已完成转义，渲染时不再二次转义（否则会出现 &amp;lt; 这类二次转义）
+            addReminder(`${headIcon} ${safeMessage}（来自 ${safeFrom} 老师）`, isInfo ? 'info' : 'auto', true);
+            // 语音播报优先念「教师提醒：正文」，让学生不看屏幕也知道是老师发来的
+            speak(`教师提醒：${rawMessage}`);
+            showSpeechToast(`${headIcon} ${rawMessage}`);
         }
 
         function stopCamera() {
@@ -1420,11 +1560,13 @@
         function resetPomodoro() { clearInterval(pomodoroInterval); pomodoroRunning = false; pomodoroSeconds = pomodoroTotalSeconds; updatePomodoroDisplay(); document.getElementById('pomodoroBtn').innerHTML = '▶ 开始'; document.getElementById('pomodoroPhase').innerText = '准备开始'; }
 
         // ========== 提醒系统 ==========
-        function addReminder(text, type) {
-            reminderHistory.push({ text, type, time: Date.now() });
+        // escaped 为 true 时表示调用方已完成 esc() 转义（教师提醒这类需要先转义再拼接的场景），
+        // 渲染时不再二次转义；其余调用方保持默认 false，由本函数统一转义。
+        function addReminder(text, type, escaped) {
+            reminderHistory.push({ text, type, time: Date.now(), escaped: !!escaped });
             const c = document.getElementById('reminderHistory');
             const colors = { 'auto': '#fbbf24', 'system': '#a855f7', 'encourage': '#34d399', 'info': '#22d3ee' };
-            c.innerHTML = reminderHistory.slice(-5).reverse().map(r => `<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05); color:${colors[r.type]||'#94a3b8'};">[${esc(new Date(r.time).toLocaleTimeString())}] ${esc(r.text)}</div>`).join('');
+            c.innerHTML = reminderHistory.slice(-5).reverse().map(r => `<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05); color:${colors[r.type]||'#94a3b8'};">[${esc(new Date(r.time).toLocaleTimeString())}] ${r.escaped ? r.text : esc(r.text)}</div>`).join('');
         }
         function sendEncouragement() {
             const msgs = ['💪 你做得很好，继续保持！','🌟 专注的你最棒！','🎯 目标就在前方，加油！','📚 每一分钟的努力都有意义','✨ 你已经很棒了，再坚持一下','🔥 你的坚持终将美好！'];

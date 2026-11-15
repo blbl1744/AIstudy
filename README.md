@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 82fdf17faf4e6add2f17f1ee6bc91211_614f4ac1df6e11f1913b525400393706
-    ReservedCode1: k/bGslhkVcY/n0cnuemlXQpheOb0Pa4/gtC28AFEbgi6AgK9TCrpxmn6k8+kyanIRje7X4Qy5IcQ1OJJHVzJcYOOAHKW/1BbD10U3IEVNDeVW/HGD1eGe1zBk0ANeb3VkImRArDldx2iC/bXV9s1OdWA3XOJ3omaFTQrCO249NjDb1NzRA5Ddg+dlVA=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 82fdf17faf4e6add2f17f1ee6bc91211_614f4ac1df6e11f1913b525400393706
-    ReservedCode2: k/bGslhkVcY/n0cnuemlXQpheOb0Pa4/gtC28AFEbgi6AgK9TCrpxmn6k8+kyanIRje7X4Qy5IcQ1OJJHVzJcYOOAHKW/1BbD10U3IEVNDeVW/HGD1eGe1zBk0ANeb3VkImRArDldx2iC/bXV9s1OdWA3XOJ3omaFTQrCO249NjDb1NzRA5Ddg+dlVA=
----
-
 # AI 学习专注度分析系统（ai-study-buddy）
 
 基于摄像头画面的**课堂/自习专注度分析系统**：学生端浏览器采集画面帧，服务端用 MediaPipe 提取
@@ -38,7 +27,7 @@ app/
 │   ├── student_routes.py   /api/student/behavior、/ws 实时推理、/api/student/notifications、
 │   │                       DELETE /api/student/my-data、学生端语音识别封装（火山引擎）
 │   └── teacher_routes.py   /api/teacher/students[/{id}/records|/live|/snapshot.jpg]、
-│                           教师下发提醒、条件注册的 /api/debug/*
+│                           POST /api/teacher/students/{id}/notify（实时督学提醒）、条件注册的 /api/debug/*
 └── main.py          装配层：FastAPI 实例、lifespan（建表 + 模型加载 + 缓存 janitor）、CORS、/healthz
 ```
 
@@ -250,4 +239,3 @@ ai-study-buddy/
 ├── .env.example         # 环境变量示例（与本文配置表一致）
 └── README.md
 ```
-*（内容由AI生成，仅供参考）*
