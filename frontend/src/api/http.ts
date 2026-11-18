@@ -12,6 +12,7 @@ import type {
   RegisterResponse,
   RoomDetail,
   SceneConfig,
+  SessionDetail,
   UserProfile,
 } from '@/types'
 
@@ -92,6 +93,16 @@ export const roomApi = {
     http.get<{ rooms: PlazaRoom[] }>('/rooms/plaza').then((res) => res.data),
   /** 房主实时快照地址（受鉴权保护，img 标签直接引用即可随请求带 Token 需另行处理） */
   snapshotUrl: (roomId: string): string => `/api/rooms/${roomId}/snapshot.jpg`,
+}
+
+/** 战报明细与 CSV 导出接口（M5） */
+export const statsApi = {
+  /** 单局战报详情：摘要 + 专注度采样点 */
+  sessionDetail: (sessionId: number): Promise<SessionDetail> =>
+    http.get<SessionDetail>('/stats/sessions/' + sessionId).then((res) => res.data),
+  /** 导出全部战报 CSV：以 Blob 返回，http 实例自动附加 Bearer Token */
+  exportCsv: (): Promise<Blob> =>
+    http.get<Blob>('/stats/export.csv', { responseType: 'blob' }).then((res) => res.data),
 }
 
 export default http

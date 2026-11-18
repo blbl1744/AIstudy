@@ -628,3 +628,51 @@ def test_ws_ai_commander_dialogue(client, monkeypatch):
     live = state_module.active_rooms.get(rid)
     assert live is not None and len(live["dialogue_history"]) >= 2
     assert live["dialogue_history"][-1]["trigger"] == "chat"
+
+
+# ========== 11. 战报明细与 CSV 导出（M5 收官） ==========
+def test_stats_session_detail_and_csv_export(client):
+    """单局战报详情归属校验（本人/404/403）+ 采样点 UTC 格式化 + UTF-8 BOM CSV 与公式注入转义"""
+    from app.db import save_behavior_record
+
+    owner = _register_and_login(client, "stats_owner", "战报主人")
+    intruder = _register_and_login(client, "stats_intruder", "越权者")
+
+    # 造一局战报 + 三条行为采样（session_id 为字符串关联键），目标列刻意用公式注入载荷
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO study_sessions (user_id, mode, scene_title, goal_text, "
+            "duration_minutes, avg_score, strikes_used, punishment_type, status) "
+            "VALUES (?,?,?,?,?,?,?,?,'completed')",
+            (owner["user_id"], "ai_solo", "流浪地球", "=1+1", 25, 88, 1, "feynman_recall"),
+        )
+        sid = cur.lastrowid
+    for score in (91, 60, 45):
+        save_behavior_record(owner["user_id"], {"focus_score": score}, session_id=str(sid))
+
+    # 未登录 -> 401/403；不存在 -> 404；他人 -> 403；本人 -> 200
+    assert client.get("/api/stats/sessions/%s" % sid).status_code in (401, 403)
+    assert client.get("/api/stats/sessions/999999", headers=owner["headers"]).status_code == 404
+    assert client.get("/api/stats/sessions/%s" % sid, headers=intruder["headers"]).status_code == 403
+    detail = client.get("/api/stats/sessions/%s" % sid, headers=owner["headers"])
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["summary"]["scene_title"] == "流浪地球"
+    assert len(body["points"]) == 3
+    assert all(p["created_at"].endswith("Z") for p in body["points"])
+    assert sorted(p["focus_score"] for p in body["points"]) == [45, 60, 91]
+
+    # CSV 导出：BOM 头、表头顺序、公式注入转义
+    resp = client.get("/api/stats/export.csv", headers=owner["headers"])
+    assert resp.status_code == 200, resp.text
+    assert resp.content.startswith(b"\xef\xbb\xbf"), "CSV 必须以 UTF-8 BOM 开头"
+    assert resp.headers["content-type"].startswith("text/csv")
+    text = resp.content.decode("utf-8-sig")
+    header_line = text.splitlines()[0]
+    assert header_line == ("结算时间(UTC),督学模式,场景名称,学习目标,专注时长(分钟),"
+                           "平均专注分,消耗机会次数,惩罚类型,结算状态")
+    assert "'=1+1" in text, "以 = 开头的文本列必须前置单引号转义"
+
+    # 越权隔离：他人导出的 CSV 不含本用户战报
+    other_text = client.get("/api/stats/export.csv", headers=intruder["headers"]).content.decode("utf-8-sig")
+    assert "流浪地球" not in other_text

@@ -21,7 +21,7 @@ from .config import (
 )
 from .db import get_db, init_db
 from .model_loader import load_trained_model
-from .routers import auth_routes, room_routes, scene_routes
+from .routers import auth_routes, room_routes, scene_routes, stats_routes
 from .state import (
     _INFER_POOL,
     _cache_janitor,
@@ -78,6 +78,7 @@ async def _unhandled_exception_handler(request, exc):
 app.include_router(auth_routes.router)
 app.include_router(room_routes.router)
 app.include_router(scene_routes.router)
+app.include_router(stats_routes.router)
 
 
 # ========== 健康检查接口 ==========

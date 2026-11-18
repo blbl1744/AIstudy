@@ -346,3 +346,32 @@ export type WsIncomingMsg =
 
 /** 服务端下行消息的 type 字段联合，供事件总线键类型约束 */
 export type WsIncomingType = WsIncomingMsg['type']
+
+
+// ===== M5 战报明细契约（GET /api/stats/sessions/{id}） =====
+
+/** 单局专注度采样点 */
+export interface FocusSample {
+  created_at: string
+  focus_score: number | null
+}
+
+/** 单局战报摘要（与后端 summary 字段一一对应） */
+export interface SessionSummary {
+  id: number
+  mode: RoomMode
+  scene_title: string
+  goal_text: string
+  duration_minutes: number
+  avg_score: number | null
+  strikes_used: number
+  punishment_type: string
+  status: 'completed' | 'failed'
+  created_at: string
+}
+
+/** 单局战报详情响应：摘要 + 采样点列表 */
+export interface SessionDetail {
+  summary: SessionSummary
+  points: FocusSample[]
+}
