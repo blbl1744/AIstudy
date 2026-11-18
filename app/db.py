@@ -336,3 +336,47 @@ def get_user_latest_record(user_id: int):
             (user_id,)
         ).fetchone()
     return normalize_record_times(dict(row)) if row else None
+
+
+# ========== M2-A：AI 剧本缓存读写 ==========
+def _normalize_work_name(work_name: str) -> str:
+    """作品名归一化：去首尾空白 + 转小写，保证「流浪地球 / 流浪地球 」命中同一条缓存"""
+    return str(work_name or "").strip().lower()
+
+
+def get_cached_scene(work_name: str):
+    """读取剧本缓存，命中返回 scene_json 字符串，未命中返回 None"""
+    key = _normalize_work_name(work_name)
+    if not key:
+        return None
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT scene_json FROM scene_cache WHERE work_name = ?", (key,)
+        ).fetchone()
+    return row["scene_json"] if row else None
+
+
+def save_cached_scene(work_name: str, scene_json: str) -> bool:
+    """写入剧本缓存（作品名归一化后 UPSERT），写入成功返回 True，空作品名返回 False"""
+    key = _normalize_work_name(work_name)
+    if not key:
+        return False
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scene_cache (work_name, scene_json) VALUES (?, ?) "
+            "ON CONFLICT(work_name) DO UPDATE SET scene_json = excluded.scene_json, "
+            "created_at = CURRENT_TIMESTAMP",
+            (key, scene_json),
+        )
+    return True
+
+
+def consume_user_shield(user_id: int) -> bool:
+    """原子扣减 1 枚自律护盾（仅在 shield_count > 0 时生效），扣减成功返回 True"""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET shield_count = shield_count - 1 "
+            "WHERE id = ? AND shield_count > 0",
+            (user_id,),
+        )
+        return cursor.rowcount > 0

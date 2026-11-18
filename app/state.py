@@ -109,6 +109,8 @@ class TTLCache:
 # scene_id / scene_title / goal_text / max_watchers / punishment_types / created_at /
 # strikes_left / distracted_streak_sec / last_frame_ts / last_frame_b64 /
 # score_history / watchers(dict[int,str]) 等字段。
+# M2-B 追加：scene_config(当前剧本) / dialogue_history(最近8轮对话) / is_locked(惩罚锁房) /
+# strikes_used(本局累计扣血次数) / active_punishment(当前启用惩罚类型)。
 active_rooms = TTLCache(maxsize=200, ttl=7200)
 
 # 每个房间的实时连接：{room_id: {user_id: WebSocket}}。WebSocket 对象由事件循环线程

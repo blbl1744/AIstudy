@@ -21,7 +21,7 @@ from .config import (
 )
 from .db import get_db, init_db
 from .model_loader import load_trained_model
-from .routers import auth_routes, room_routes
+from .routers import auth_routes, room_routes, scene_routes
 from .state import (
     _INFER_POOL,
     _cache_janitor,
@@ -74,9 +74,10 @@ async def _unhandled_exception_handler(request, exc):
     return JSONResponse(status_code=500, content={"detail": "服务暂时不可用"})
 
 
-# ========== 路由注册（M1-B：统一认证 + 房间/公告广场） ==========
+# ========== 路由注册（M1-B：统一认证 + 房间/公告广场；M2-A：AI 剧本编译） ==========
 app.include_router(auth_routes.router)
 app.include_router(room_routes.router)
+app.include_router(scene_routes.router)
 
 
 # ========== 健康检查接口 ==========

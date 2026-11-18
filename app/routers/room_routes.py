@@ -26,10 +26,13 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
 from .. import state
+from ..ai_commander import stream_commander_dialogue
 from ..analyzer import analyzer
 from ..auth import get_current_user, verify_jwt_token
 from ..config import CORS_ALLOW_ORIGINS, logger
 from ..db import calc_rank_title, get_db, save_behavior_record
+from ..punishment import evaluate_strike, verify_punishment_submission
+from ..scene_generator import compile_scene, list_presets
 
 router = APIRouter()
 
@@ -38,6 +41,18 @@ SENTINEL_ALERT_SEC = 8.0         # 连续走神达到该秒数触发预警
 SENTINEL_COOLDOWN_SEC = 30.0     # 同一房间两次预警的最小间隔（防刷屏）
 DISTRACTED_SCORE = 60            # focus_score 低于该值或为 None 视为走神
 SOUND_WHITELIST = {"knock_board", "clear_throat", "alarm", "cheer"}
+
+# ===== 建设性惩罚提示文案（三次机会耗尽时下发给学习者）=====
+_PUNISHMENT_PROMPT = {
+    "feynman_recall": "任务失守：请用费曼技巧把本轮目标讲清楚（不少于15字有效内容）以解除锁定。",
+    "emergency_sprint": "任务失守：请保持专注冲刺满 5 分钟后提交，以解除锁定。",
+    "goal_breakdown": "任务失守：请把本轮目标拆解为至少 2 个具体微行动步骤后提交，以解除锁定。",
+}
+
+
+def _punishment_prompt(ptype: str) -> str:
+    """按惩罚类型返回解锁提示（非法类型回退费曼输出文案）"""
+    return _PUNISHMENT_PROMPT.get(ptype, _PUNISHMENT_PROMPT["feynman_recall"])
 
 # WebSocket 握手失败关闭码
 WS_CLOSE_BAD_TOKEN = 4401        # JWT 缺失或无效
@@ -56,6 +71,7 @@ class CreateRoomRequest(BaseModel):
     mode: Literal["ai_solo", "peer_1v1", "peer_group"]
     is_public: bool = True
     scene_id: str = ""
+    work_name: str = ""
     scene_title: str = ""
     goal_text: str = Field(..., min_length=1, max_length=100)
     max_watchers: int = Field(default=3, ge=1, le=20)
@@ -89,12 +105,32 @@ def _current_user_id(user: dict) -> int:
     return int(user_id)
 
 
+async def _resolve_scene_config(scene_id: str, work_name: str) -> dict:
+    """异步解析房间剧本：work_name 调编译器，scene_id 匹配内置预设，均无则空字典"""
+    work_name = (work_name or "").strip()
+    if work_name:
+        try:
+            return await compile_scene(work_name)
+        except Exception as exc:
+            logger.warning("房间剧本编译失败，回退空剧本：%s", exc)
+            return {}
+    sid = (scene_id or "").strip()
+    if sid:
+        for preset in list_presets():
+            if preset.get("scene_id") == sid:
+                return preset
+    return {}
+
+
 # ========== REST：创建房间 ==========
 @router.post("/api/rooms")
 async def create_room(request: CreateRoomRequest, user: dict = Depends(get_current_user)):
     """登录用户创建房间；goal_text 已由模型完成长度与 XSS 校验"""
     user_id = _current_user_id(user)
     room_id = uuid.uuid4().hex
+    # M2-B：解析剧本——work_name 优先调编译器；否则按 scene_id 匹配预设；
+    # 两者都取不到时留空字典，前端仍可正常渲染（对话指挥官会回退通用称谓）。
+    scene_config = await _resolve_scene_config(request.scene_id, request.work_name)
     room = {
         "room_id": room_id,
         "host_id": user_id,
@@ -102,6 +138,7 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
         "mode": request.mode,
         "is_public": request.is_public,
         "scene_id": request.scene_id,
+        "work_name": (request.work_name or "").strip(),
         "scene_title": request.scene_title,
         "goal_text": request.goal_text,
         "max_watchers": request.max_watchers,
@@ -109,6 +146,13 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
         "created_at": _now_ts(),
         "strikes_left": 3,
         "distracted_streak_sec": 0.0,
+        # ===== M2-B：剧本与流式对话状态 =====
+        "scene_config": scene_config,          # 当前房间挂载的完整 SceneConfig
+        "dialogue_history": [],                # 最近 8 轮指挥官对话
+        "is_locked": False,                    # 惩罚锁房标记（锁房时忽略常规推理）
+        "strikes_used": 0,                     # 本局累计扣血次数（如实写战报）
+        "active_punishment": "",               # 当前触发的建设性惩罚类型
+        "punishment_type": "",                 # evaluate_strike 回写的惩罚类型（供其读取）
         "last_frame_ts": None,
         "last_frame_b64": None,
         "score_history": [],
@@ -203,6 +247,25 @@ async def _notify_watcher_update(room_id: str, room: dict) -> None:
     })
 
 
+async def _broadcast_dialogue(room_id: str, room: dict, trigger: str,
+                              user_input: str = "", target_user_id=None) -> None:
+    """驱动一轮指挥官流式对话：先发 start，逐块广播 chunk/audio，最后发 end。
+
+    target_user_id 为 None 时广播全房；指定时仅单播给目标用户（如 reply 仅回求助者）。
+    对话文本落库由 ai_commander 负责，本函数只负责 WS 消息编排。
+    """
+    await _broadcast(room_id, {"type": "ai_dialogue_start", "trigger": trigger})
+    try:
+        async for piece in stream_commander_dialogue(room, trigger, user_input):
+            if target_user_id is None:
+                await _broadcast(room_id, piece)
+            else:
+                await _send_to(room_id, target_user_id, piece)
+    except Exception as exc:
+        logger.warning("指挥官对话生成异常（room_id=%s）：%s", room_id, exc)
+    await _broadcast(room_id, {"type": "ai_dialogue_end", "trigger": trigger})
+
+
 # ========== 推理回调：事件循环内回写状态与广播 ==========
 async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> None:
     """推理完成后的统一收尾：写行为记录、更新分数/走神时长、广播结果并判定哨兵"""
@@ -229,27 +292,50 @@ async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> 
     except Exception:
         logger.exception("行为采样写入失败（room_id=%s）", room_id)
 
-    # 2) 更新分数历史与连续走神秒数（按帧间隔累加，可注入时钟）
+    # 2) 更新分数历史并计算帧间隔（时钟可注入，便于单测压缩长时延）
     room.setdefault("score_history", []).append(score)
     now = _now_ts()
     prev = room.get("last_frame_ts")
     delta = (now - prev) if prev is not None else 0.0
     room["last_frame_ts"] = now
     distracted = (score is None) or (score < DISTRACTED_SCORE)
-    if distracted:
-        room["distracted_streak_sec"] = float(room.get("distracted_streak_sec") or 0.0) + delta
-    else:
-        room["distracted_streak_sec"] = 0.0
 
-    # 3) 分析结果广播给全房
+    # 2.5) 惩罚引擎统一裁决：内部维护走神累计（走神累加、端正清零）、扣血与锁房状态
+    strike = evaluate_strike(room, distracted, delta)
+    streak_sec = float(strike.get("distracted_streak_sec") or 0.0)
+
+    # 3) 分析结果广播给全房（生命值与走神时长均取引擎回写后的最新值）
     await _broadcast(room_id, {
         "type": "analysis_update",
         "focus_score": score,
         "action_label": payload.get("action_label"),
         "annotated_image": payload.get("annotated_image"),
         "strikes_left": room.get("strikes_left", 3),
-        "distracted_streak_sec": round(room["distracted_streak_sec"], 2),
+        "distracted_streak_sec": round(streak_sec, 2),
     })
+
+    # 3.5) 惩罚联动：按引擎事件累加真实扣血次数并广播战术纠偏/惩罚消息
+    event = strike.get("event")
+    if event in ("strike_1", "strike_2"):
+        room["strikes_used"] = int(room.get("strikes_used", 0) or 0) + 1
+        await _broadcast_dialogue(room_id, room, "distraction")
+    elif event in ("strike_3", "shield_saved"):
+        # 第 3 次耗尽：无论护盾抵消与否，都记一次真实扣血
+        room["strikes_used"] = int(room.get("strikes_used", 0) or 0) + 1
+        if strike.get("shield_saved"):
+            await _broadcast(room_id, {
+                "type": "punishment_cleared",
+                "shield_saved": True,
+                "strikes_left": room.get("strikes_left", 1),
+            })
+        else:
+            ptype = strike.get("punishment_type") or ""
+            room["active_punishment"] = ptype
+            await _broadcast(room_id, {
+                "type": "punishment_required",
+                "punishment_type": ptype,
+                "prompt": _punishment_prompt(ptype),
+            })
 
     # 4) 哨兵预警：有督学官在线、连续走神达标且已过冷却期时，仅向督学官推送
     watchers = room.get("watchers") or {}
@@ -269,7 +355,9 @@ async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> 
 def _settle_session(room: dict, user_id: int, duration_minutes: int,
                     avg_score, strikes_used: int) -> dict:
     """结束一局：写 study_sessions(completed) 并累加专注时长、军衔、干净局连击与护盾"""
-    punishment = ",".join(room.get("punishment_types") or [])
+    # 惩罚类型如实记录：优先本局实际触发的类型，未触发时回退开局勾选组合
+    actual_ptype = room.get("active_punishment") or room.get("punishment_type") or ""
+    punishment = actual_ptype or ",".join(room.get("punishment_types") or [])
     with get_db() as conn:
         conn.execute(
             "INSERT INTO study_sessions "
@@ -349,6 +437,11 @@ async def room_ws(websocket: WebSocket, room_id: str):
     await _notify_watcher_update(room_id, room)
     loop = asyncio.get_running_loop()
 
+    # 开局领命：房主首次连入触发一次 proactive 流式对话（用房间级标记防重连重复触发）
+    if is_host and not room.get("_proactive_sent"):
+        room["_proactive_sent"] = True
+        await _broadcast_dialogue(room_id, room, "proactive")
+
     try:
         while True:
             try:
@@ -362,6 +455,10 @@ async def room_ws(websocket: WebSocket, room_id: str):
             if is_host:
                 # ===== 学习者消息 =====
                 if mtype == "frame":
+                    # 锁房态：忽略常规推理，仅下发解锁提示（惩罚提交走独立分支）
+                    if room.get("is_locked"):
+                        await websocket.send_json({"type": "room_locked", "msg": "请先完成惩罚解锁"})
+                        continue
                     image = msg.get("image")
                     if not image:
                         continue
@@ -386,6 +483,34 @@ async def room_ws(websocket: WebSocket, room_id: str):
                     future = state._INFER_POOL.submit(analyzer.analyze, image, scene=scene, student_id=user_id)
                     future.add_done_callback(_done)
 
+                elif mtype == "user_message":
+                    # 学习者求助/互动：1~200 字校验 + 控制字符清洗，触发 chat 流式回复
+                    raw = msg.get("text", "")
+                    text = "".join(ch for ch in str(raw) if ch == "\n" or (ord(ch) >= 32 and ord(ch) != 127))
+                    text = text.strip()
+                    if 1 <= len(text) <= 200:
+                        await _broadcast_dialogue(room_id, room, "chat", user_input=text)
+
+                elif mtype == "punishment_submit":
+                    # 惩罚提交：规则校验通过即解锁并广播，未通过仅向提交者回 reason
+                    verdict = verify_punishment_submission(
+                        str(msg.get("punishment_type", "") or ""),
+                        msg.get("content", ""),
+                        str(room.get("goal_text", "") or ""),
+                        room=room,
+                    )
+                    if verdict["passed"]:
+                        await _broadcast(room_id, {
+                            "type": "punishment_cleared",
+                            "shield_saved": False,
+                            "strikes_left": room.get("strikes_left", 1),
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "punishment_rejected",
+                            "reason": verdict.get("reason", "校验未通过"),
+                        })
+
                 elif mtype == "finish_session":
                     now = _now_ts()
                     created = float(room.get("created_at") or now)
@@ -393,7 +518,8 @@ async def room_ws(websocket: WebSocket, room_id: str):
                     scores = [s for s in (room.get("score_history") or [])
                               if isinstance(s, (int, float)) and not isinstance(s, bool)]
                     avg_score = round(sum(scores) / len(scores)) if scores else None
-                    strikes_used = max(0, 3 - int(room.get("strikes_left", 3)))
+                    # 如实取引擎与联动累加的真实扣血次数（护盾抵消也计一次），不用 strikes_left 反推
+                    strikes_used = int(room.get("strikes_used", 0) or 0)
                     settled = _settle_session(room, user_id, duration_minutes, avg_score, strikes_used)
                     await _broadcast(room_id, {
                         "type": "session_finished",

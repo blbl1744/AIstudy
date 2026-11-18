@@ -50,7 +50,7 @@ main ──► routers ──► analyzer ──► model_loader ──► state
 
 ## 二、环境变量配置表
 
-所有配置项均以 `AI_STUDY_` 为前缀，命名与根目录 [`.env.example`](.env.example) **完全一致**（共 11 项）。
+所有配置项均以 `AI_STUDY_` 为前缀，命名与根目录 [`.env.example`](.env.example) **完全一致**（共 16 项）。
 本地开发可复制 `.env.example` 为 `.env`；容器部署通过 `-e` / `--env-file` 注入，**严禁把 `.env` 打进镜像**。
 
 | 环境变量 | 必填 | 默认值 | 说明 |
@@ -66,6 +66,11 @@ main ──► routers ──► analyzer ──► model_loader ──► state
 | `AI_STUDY_LOG_LEVEL` | 否 | `INFO` | 日志级别：`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`；非法取值自动回落 `INFO` |
 | `AI_STUDY_AUTO_ALERT_SECONDS` | 否 | `15` | 持续分心自动预警阈值：连续分心（未检测到人体或专注度 < 60）累计达到该秒数即触发一次温和提醒（`feat/extensions` 扩展二） |
 | `AI_STUDY_AUTO_ALERT_COOLDOWN` | 否 | `60` | 自动提醒冷却时间：同一学生两次自动提醒的最小间隔秒数，冷却期内持续分心也不会重复下发，防止刷屏 |
+| `AI_STUDY_LLM_BASE_URL` | 否 | `https://api.openai.com/v1` | 兼容 OpenAI 协议的模型接口根地址，剧本编译与对话指挥官会拼接 `/chat/completions`（M2-A/M2-B） |
+| `AI_STUDY_LLM_API_KEY` | 否 | 空（离线降级） | 大模型 API Key；留空时剧本编译回退内置离线剧本、对话指挥官回退定制短句流，全程不阻断学习流程 |
+| `AI_STUDY_LLM_MODEL` | 否 | `gpt-4o-mini` | 剧本编译与流式对话使用的模型名 |
+| `AI_STUDY_STRIKE_SECONDS` | 否 | `10` | 连续走神累计达该秒数判定为一次有效失误（扣 1 点生命值）；调大更宽容、调小更严格，用 float 解析便于测试压缩 |
+| `AI_STUDY_TTS_ENABLED` | 否 | `0` | 指挥官对话是否启用 edge-tts 语音合成：`1`=启用（需安装 `edge_tts` 且可访问外网），`0`=关闭；失败时静默降级为纯文本对话 |
 
 > 说明：`AI_STUDY_DB` 与 `AI_STUDY_LOG_LEVEL` 在 P3-4 收尾时补齐为真实生效的配置项
 > （此前 README 约定但代码未读取，属「文档承诺未落地」缺口），便于容器挂卷与统一调级，行为默认值与原实现完全一致。

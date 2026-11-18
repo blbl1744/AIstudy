@@ -155,6 +155,20 @@ AUTO_ALERT_SECONDS = int(os.getenv("AI_STUDY_AUTO_ALERT_SECONDS", "15"))
 AUTO_ALERT_COOLDOWN = int(os.getenv("AI_STUDY_AUTO_ALERT_COOLDOWN", "60"))
 
 
+# ========== M2-A：AI 剧本编译器与三次机会惩罚引擎配置 ==========
+# 兼容 OpenAI 协议的大模型接口根地址（compile_scene 会在此后拼接 /chat/completions）
+LLM_BASE_URL = (os.getenv("AI_STUDY_LLM_BASE_URL") or "https://api.openai.com/v1").strip()
+# 大模型 API Key：留空时编译器跳过在线生成，直接平滑回退内置离线剧本
+LLM_API_KEY = (os.getenv("AI_STUDY_LLM_API_KEY") or "").strip()
+# 剧本编译使用的模型名
+LLM_MODEL = (os.getenv("AI_STUDY_LLM_MODEL") or "gpt-4o-mini").strip()
+# 连续走神累计达到该秒数判定为一次有效失误（扣 1 点生命值）；用 float 便于单测压缩
+STRIKE_SECONDS = float(os.getenv("AI_STUDY_STRIKE_SECONDS", "10"))
+# M2-B：是否在指挥官对话中启用 edge-tts 语音合成（1=启用，其余关闭）。
+# 默认关闭：语音合成依赖可选的 edge_tts 包与外网；关闭时对话仅输出文本短句块。
+TTS_ENABLED = (os.getenv("AI_STUDY_TTS_ENABLED") or "0").strip()
+
+
 # ========== P1-8：配置归一化（唯一真源原则） ==========
 # 说明：旧的四个标量配置项与 POSE_THRESHOLDS 存在语义重叠，这里统一以标量配置为准回灌到阈值字典，
 # 保证「无论配置来自 config.py 还是 fallback，判定阈值只有一份来源」，避免同名阈值两处各说各话。

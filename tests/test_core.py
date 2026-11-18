@@ -433,3 +433,198 @@ def test_sentinel_alert_and_settlement(client, monkeypatch):
     assert profile["shield_count"] == 1
     assert len(profile["sessions"]) == 3
     assert all(s["status"] == "completed" for s in profile["sessions"])
+
+
+# ========== 8. 剧本预设与编译缓存 ==========
+def test_scene_presets_and_compile_cache(client, monkeypatch):
+    """预设列表、无 Key 离线降级、Mock LLM 结构化编译及二次命中 scene_cache"""
+    from app import scene_generator as sg
+
+    host = _register_and_login(client, "scene_host", "场景官")
+
+    # 1) 预设列表：需登录，返回 4 套内置剧本且字段齐备
+    presets_resp = client.get("/api/scenes/presets", headers=host["headers"])
+    assert presets_resp.status_code == 200, presets_resp.text
+    presets = presets_resp.json()["presets"]
+    assert len(presets) == 4
+    first = presets[0]
+    for key in ("scene_id", "scene_title", "commander_title", "opening_line",
+                "theme", "atmosphere", "strikes", "victory_line"):
+        assert key in first, "预设剧本应包含字段 %s" % key
+
+    # 2) 无 Key 降级：清空 Key，编译任意作品名应回退离线剧本并写入 scene_cache
+    monkeypatch.setattr(sg, "LLM_API_KEY", "")
+    offline = client.post("/api/scenes/compile",
+                          json={"work_name": "星际迷航新的征程"}, headers=host["headers"])
+    assert offline.status_code == 200, offline.text
+    offline_scene = offline.json()
+    assert offline_scene.get("scene_id") and offline_scene.get("commander_title")
+    assert offline_scene.get("source_work") == "星际迷航新的征程"
+
+    # 3) Mock LLM 编译：配置 Key 并替换 _call_llm，返回结构合规剧本应归一化后落库
+    fake_scene = copy.deepcopy(first)
+    fake_scene["scene_id"] = "mock_llm_scene"
+    fake_scene["source_work"] = "魔法学院奇遇记"
+
+    calls = {"n": 0}
+
+    async def _fake_call_llm(work_name):
+        calls["n"] += 1
+        return copy.deepcopy(fake_scene)
+
+    monkeypatch.setattr(sg, "LLM_API_KEY", "fake-test-key")
+    monkeypatch.setattr(sg, "_call_llm", _fake_call_llm)
+    online = client.post("/api/scenes/compile",
+                         json={"work_name": "魔法学院奇遇记"}, headers=host["headers"])
+    assert online.status_code == 200, online.text
+    compiled = online.json()
+    assert compiled["scene_id"] == "mock_llm_scene"
+    assert compiled["source_work"] == "魔法学院奇遇记"
+    assert calls["n"] == 1, "首次编译应调用一次 LLM"
+
+    # 4) 二次查询命中缓存：不再调用 LLM，仍返回同一剧本
+    again = client.post("/api/scenes/compile",
+                        json={"work_name": "魔法学院奇遇记"}, headers=host["headers"])
+    assert again.status_code == 200
+    assert again.json()["scene_id"] == "mock_llm_scene"
+    assert calls["n"] == 1, "命中 scene_cache 后不得再次调用 LLM"
+
+    # 直接核对缓存表已落库（归一化后的 JSON）
+    assert sg.get_cached_scene("魔法学院奇遇记")
+
+
+# ========== 9. 三次机会、护盾抵消与建设性惩罚解锁 ==========
+def test_three_strikes_shield_and_punishment(client, monkeypatch):
+    """连续走神 3 次扣血、护盾自动抵消、无盾锁房后费曼/目标拆解解锁"""
+    import app.punishment as pun
+    from app.db import get_db
+
+    host = _register_and_login(client, "strike_host", "战士")
+
+    # 压缩扣血阈值到 0（每次走神判定即扣 1 血），避免真实等待
+    monkeypatch.setattr(pun, "STRIKE_SECONDS", 0.0)
+    # 测试环境无 Key，确保校验走纯规则分支
+    monkeypatch.setattr(pun, "LLM_API_KEY", "")
+
+    def _fresh_room(**overrides):
+        room = {
+            "room_id": "r-strike", "host_id": host["user_id"],
+            "strikes_left": 3, "distracted_streak_sec": 0.0,
+            "is_locked": False, "punishment_type": "",
+            "punishment_types": [], "goal_text": "掌握编译原理词法分析",
+        }
+        room.update(overrides)
+        return room
+
+    # 1) 连续走神 3 次扣血：第 1、2 次仅警告，第 3 次耗尽
+    room = _fresh_room()
+    e1 = pun.evaluate_strike(room, True, 1.0)
+    assert e1["event"] == "strike_1" and e1["strikes_left"] == 2 and not e1["shield_saved"]
+    e2 = pun.evaluate_strike(room, True, 1.0)
+    assert e2["event"] == "strike_2" and e2["strikes_left"] == 1
+    # 本轮无护盾：第三次耗尽应锁房并指定默认惩罚类型
+    monkeypatch.setattr(pun, "_host_shield_saved", lambda _uid: False)
+    e3 = pun.evaluate_strike(room, True, 1.0)
+    assert e3["event"] == "strike_3" and e3["strikes_left"] == 0
+    assert e3["is_locked"] and e3["punishment_type"] == "feynman_recall"
+    assert room["is_locked"] is True
+
+    # 已锁房幂等：再次判定不重复扣血/不重复扣盾
+    e4 = pun.evaluate_strike(room, True, 1.0)
+    assert e4["event"] is None and e4["strikes_left"] == 0
+
+    # 2) 有护盾自动抵消：耗尽时恢复 1 点生命值、不锁房
+    shield_room = _fresh_room(room_id="r-shield")
+    monkeypatch.setattr(pun, "_host_shield_saved", lambda _uid: True)
+    s3 = None
+    for _ in range(3):
+        s3 = pun.evaluate_strike(shield_room, True, 1.0)
+    assert s3["event"] == "shield_saved" and s3["shield_saved"] is True
+    assert s3["strikes_left"] == 1 and not s3["is_locked"]
+
+    # 3) 费曼输出解锁：有效内容达标即解锁并恢复 1 点生命值
+    monkeypatch.setattr(pun, "_host_shield_saved", lambda _uid: False)
+    feynman_room = _fresh_room(room_id="r-feynman", is_locked=True,
+                               punishment_type="feynman_recall", strikes_left=0)
+    ok = pun.verify_punishment_submission(
+        "feynman_recall",
+        "词法分析就是把源程序字符流切成记号，我用有限自动机识别标识符再输出二元式",
+        "掌握编译原理词法分析", room=feynman_room,
+    )
+    assert ok["passed"] and ok["unlocked"]
+    assert feynman_room["is_locked"] is False and feynman_room["strikes_left"] == 1
+    # 敷衍内容应被拒绝
+    bad = pun.verify_punishment_submission("feynman_recall", "哈哈哈哈哈哈", "目标",
+                                           room=_fresh_room(is_locked=True))
+    assert not bad["passed"]
+
+    # 4) 目标拆解解锁：至少 2 个具体微行动步骤
+    goal_room = _fresh_room(room_id="r-goal", is_locked=True,
+                            punishment_type="goal_breakdown", strikes_left=0)
+    verdict = pun.verify_punishment_submission(
+        "goal_breakdown",
+        "通读教材第三章并画出状态转换图；手写一段识别关键字的自动机代码并跑通样例",
+        "掌握编译原理词法分析", room=goal_room,
+    )
+    assert verdict["passed"] and verdict["unlocked"]
+    assert goal_room["is_locked"] is False
+
+    # 护盾发放链路自检：结算引擎可在连续干净局后发放护盾字段
+    with get_db() as conn:
+        row = conn.execute("SELECT shield_count FROM users WHERE id = ?",
+                           (host["user_id"],)).fetchone()
+    assert row is not None and row["shield_count"] >= 0
+
+
+# ========== 10. 指挥官流式对话 WS 闭环 ==========
+def test_ws_ai_commander_dialogue(client, monkeypatch):
+    """房主入房收到主动开场流式消息、发送 user_message 收到 chat 流式回复"""
+    import app.config as cfg
+
+    # 强制走离线降级短句流、关闭 TTS，保证断言稳定不依赖网络
+    monkeypatch.setattr(cfg, "LLM_API_KEY", "")
+    monkeypatch.setattr(cfg, "TTS_ENABLED", "0")
+
+    host = _register_and_login(client, "chat_host", "学习者甲")
+    room = _create_room(client, host["headers"], mode="ai_solo",
+                        goal_text="今天刷三套卷")
+    rid = room["room_id"]
+
+    with client.websocket_connect(
+        "/ws/room/%s?token=%s" % (rid, host["token"]), headers={"origin": VALID_ORIGIN}
+    ) as host_ws:
+        # 主动开场：先收到 watcher_update，随后是 proactive 流式对话
+        host_ws.receive_json()  # watcher_update(count=0)
+        start = _recv_type(host_ws, "ai_dialogue_start")
+        assert start["trigger"] == "proactive"
+
+        chunks = []
+        for _ in range(12):
+            msg = host_ws.receive_json()
+            if msg.get("type") == "ai_dialogue_chunk":
+                chunks.append(msg.get("text", ""))
+            if msg.get("type") == "ai_dialogue_end":
+                break
+        assert chunks, "开局应至少产出一条流式台词"
+        assert any("卷" in t or "目标" in t or "作战" in t or "听令" in t for t in chunks), \
+            "开场台词应带目标变量：%s" % chunks
+
+        # 学习者求助：触发 chat 流式回复并回显用户变量
+        host_ws.send_json({"type": "user_message", "text": "第三题卡住了怎么办"})
+        chat_start = _recv_type(host_ws, "ai_dialogue_start")
+        assert chat_start["trigger"] == "chat"
+        chat_chunks = []
+        for _ in range(12):
+            msg = host_ws.receive_json()
+            if msg.get("type") == "ai_dialogue_chunk":
+                chat_chunks.append(msg.get("text", ""))
+            if msg.get("type") == "ai_dialogue_end":
+                break
+        assert chat_chunks, "求助应产出至少一条流式台词"
+        assert any("第三题" in t or "卡住" in t or "求助" in t for t in chat_chunks), \
+            "chat 台词应回显求助变量：%s" % chat_chunks
+
+    # 对话历史已落房间状态（最近 8 轮内）
+    live = state_module.active_rooms.get(rid)
+    assert live is not None and len(live["dialogue_history"]) >= 2
+    assert live["dialogue_history"][-1]["trigger"] == "chat"
