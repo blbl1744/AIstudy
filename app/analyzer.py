@@ -35,10 +35,25 @@ from .model_loader import (
     load_trained_model,
     predict_focus,
 )
-# ========== MediaPipe 初始化 ==========
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-mp_face_mesh = mp.solutions.face_mesh
+# ========== MediaPipe 初始化（兼容新版：solutions 可能缺失） ==========
+# 新版 mediapipe（>=0.10.21）移除了 mp.solutions（改用 tasks API），直接访问
+# mp.solutions.pose 会在导入期抛 AttributeError 导致服务无法启动。这里用 getattr
+# 安全探测；缺失时记录警告并降级，由 analyze()/extract_pose_features_from_frame()
+# 走规则评分兜底逻辑，保证有无 solutions 两种环境都能正常导入与运行。
+_mp_solutions = getattr(mp, "solutions", None)
+MP_SOLUTIONS_AVAILABLE = _mp_solutions is not None
+if MP_SOLUTIONS_AVAILABLE:
+    mp_pose = _mp_solutions.pose
+    mp_drawing = _mp_solutions.drawing_utils
+    mp_face_mesh = _mp_solutions.face_mesh
+else:
+    logger.warning(
+        "mediapipe 未提供 solutions 属性（可能为新版本），姿态/人脸地标推理不可用，"
+        "已降级为规则评分兜底；如需地标推理请将 mediapipe 锁定为 >=0.10.14,<0.10.21"
+    )
+    mp_pose = None
+    mp_drawing = None
+    mp_face_mesh = None
 
 # ========== P2-1：MediaPipe 实例按线程隔离（消除全局单例串台） ==========
 # 背景：MediaPipe 的 Pose / FaceMesh 对象内部持有 C++ 图与状态，不是线程安全的。
@@ -59,7 +74,9 @@ def _build_pose_config():
 
 
 def _get_pose():
-    """获取当前线程独占的 Pose 实例（懒加载）"""
+    """获取当前线程独占的 Pose 实例（懒加载）；solutions 缺失时返回 None"""
+    if mp_pose is None:
+        return None
     inst = getattr(_MP_TLS, "pose", None)
     if inst is None:
         inst = mp_pose.Pose(**_build_pose_config())
@@ -68,7 +85,9 @@ def _get_pose():
 
 
 def _get_face_mesh():
-    """获取当前线程独占的 FaceMesh 实例（懒加载，同样强制静态图模式）"""
+    """获取当前线程独占的 FaceMesh 实例（懒加载，同样强制静态图模式）；缺失时返回 None"""
+    if mp_face_mesh is None:
+        return None
     inst = getattr(_MP_TLS, "face_mesh", None)
     if inst is None:
         inst = mp_face_mesh.FaceMesh(
@@ -95,9 +114,13 @@ def extract_pose_features(image_path):
 
 def extract_pose_features_from_frame(frame):
     """从内存中的视频帧提取 13 维姿态特征（避免磁盘 IO）"""
+    pose = _get_pose()
+    if pose is None:
+        # mediapipe solutions 缺失：无法提取地标特征，返回 None 由调用方降级
+        return None
     try:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = _get_pose().process(rgb_frame)
+        results = pose.process(rgb_frame)
         if not results.pose_landmarks:
             return None
         return extract_model_features(results.pose_landmarks.landmark)
@@ -155,8 +178,15 @@ class MediaPipePoseAnalyzer:
                 return self._fallback_analysis(scene, image_base64)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             # P2-1：从 threading.local 取当前工作线程独占的实例，避免多学生并发串台
-            results = _get_pose().process(rgb_frame)
-            face_results = _get_face_mesh().process(rgb_frame)
+            pose = _get_pose()
+            face_mesh = _get_face_mesh()
+            if pose is None or face_mesh is None:
+                # mediapipe solutions 缺失（新版 API 变更）：优雅降级走规则评分兜底，
+                # 不抛出 AttributeError，保证服务在无地标推理能力时仍可用。
+                logger.warning("mediapipe solutions 不可用，本次分析降级为规则评分兜底")
+                return self._fallback_analysis(scene, image_base64)
+            results = pose.process(rgb_frame)
+            face_results = face_mesh.process(rgb_frame)
             if not results.pose_landmarks:
                 return self._fallback_analysis(scene, image_base64)
             landmarks = results.pose_landmarks.landmark

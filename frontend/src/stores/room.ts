@@ -8,10 +8,13 @@ import { roomApi } from '@/api/http'
 import { RoomSocket } from '@/api/roomSocket'
 import type {
   CreateRoomRequest,
+  DialogueHistoryItem,
   DialogueTrigger,
   RoomDetail,
+  RoomMeta,
   WsIncomingMsg,
   WsOutgoingMsg,
+  WsRoomStateSyncMsg,
 } from '@/types'
 
 /** 一条指挥官字幕 */
@@ -33,6 +36,8 @@ export const useRoomStore = defineStore('room', () => {
   // ===== 状态 =====
   const roomId = ref('')
   const roomDetail = ref<RoomDetail | null>(null)
+  // 学习目标：暂离重返/刷新后由 meta 或 room_state_sync 恢复，独立于 roomDetail
+  const goalText = ref('')
   const strikesLeft = ref(3)
   const focusScore = ref<number | null>(null)
   const distractedStreakSec = ref(0)
@@ -64,9 +69,49 @@ export const useRoomStore = defineStore('room', () => {
   function applyRoomDetail(room: RoomDetail): void {
     roomId.value = room.room_id
     roomDetail.value = room
+    goalText.value = room.goal_text ?? ''
     strikesLeft.value = room.strikes_left ?? 3
     isLocked.value = Boolean(room.is_locked)
     activePunishment.value = room.active_punishment ?? ''
+  }
+
+  /**
+   * 把后端历史对话条目映射为字幕行。
+   * trigger 收紧到合法联合成员，非法值回退 chat；id 用负数避免与实时 ++dialogueSeq 冲突。
+   */
+  function applyDialogueHistory(history: DialogueHistoryItem[]): void {
+    if (!Array.isArray(history) || history.length === 0) {
+      return
+    }
+    const validTriggers: DialogueTrigger[] = ['proactive', 'distraction', 'chat']
+    dialogueLines.value = history.map((item, index) => ({
+      id: -(index + 1),
+      text: String(item?.text ?? ''),
+      trigger: validTriggers.includes(item?.trigger as DialogueTrigger)
+        ? (item.trigger as DialogueTrigger)
+        : 'chat',
+    }))
+  }
+
+  /** 用房间元信息（GET /api/rooms/:id）恢复现场，供暂离重返/刷新后校验与还原 */
+  function applyRoomMeta(meta: RoomMeta): void {
+    roomId.value = meta.room_id
+    goalText.value = meta.goal_text ?? ''
+    strikesLeft.value = meta.strikes_left ?? 3
+    isLocked.value = Boolean(meta.is_locked)
+    activePunishment.value = meta.active_punishment ?? ''
+  }
+
+  /** 房间级现场字段：meta 与 room_state_sync 共有的进度与惩罚状态 */
+  type SceneSnapshot = Pick<WsRoomStateSyncMsg,
+    'goal_text' | 'strikes_left' | 'is_locked' | 'active_punishment' | 'scene_config'>
+
+  /** 应用现场快照（仅状态字段，场景配置由视图层交给 sceneStore），供重连恢复进度 */
+  function applySceneSnapshot(snapshot: SceneSnapshot): void {
+    goalText.value = snapshot.goal_text ?? ''
+    strikesLeft.value = snapshot.strikes_left ?? 3
+    isLocked.value = Boolean(snapshot.is_locked)
+    activePunishment.value = snapshot.active_punishment ?? ''
   }
 
   /** 构造 WebSocket 管理器实例（不自动连接，由调用方决定时机） */
@@ -151,6 +196,12 @@ export const useRoomStore = defineStore('room', () => {
     ws.on('session_finished', () => {
       isLocked.value = false
     })
+
+    // 房主重连后的现场快照：恢复目标/机会/锁房/惩罚与历史对话（场景由视图层还原）
+    ws.on('room_state_sync', (msg) => {
+      applySceneSnapshot(msg)
+      applyDialogueHistory(msg.dialogue_history)
+    })
   }
 
   /** 上行发送包装 */
@@ -164,6 +215,7 @@ export const useRoomStore = defineStore('room', () => {
     socket.value = null
     roomId.value = ''
     roomDetail.value = null
+    goalText.value = ''
     strikesLeft.value = 3
     focusScore.value = null
     distractedStreakSec.value = 0
@@ -181,6 +233,7 @@ export const useRoomStore = defineStore('room', () => {
   return {
     roomId,
     roomDetail,
+    goalText,
     strikesLeft,
     focusScore,
     distractedStreakSec,
@@ -197,6 +250,9 @@ export const useRoomStore = defineStore('room', () => {
     subtitleText,
     createRoom,
     applyRoomDetail,
+    applyRoomMeta,
+    applySceneSnapshot,
+    applyDialogueHistory,
     createSocket,
     send,
     reset,

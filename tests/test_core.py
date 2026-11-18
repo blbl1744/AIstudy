@@ -253,14 +253,22 @@ def test_room_create_and_plaza(client):
     assert pub["max_watchers"] == 3 and pub["host_nickname"] == "房主甲"
     assert not any(k.startswith("_") for k in pub)
 
-    rooms = client.get("/api/rooms/plaza", headers=host["headers"]).json()["rooms"]
+    # 暂离返回闭环：房主本人房间仍出现在广场，并带房主在线标记，供其「返回学习室」
+    own_rooms = client.get("/api/rooms/plaza", headers=host["headers"]).json()["rooms"]
+    own_ids = {r["room_id"] for r in own_rooms}
+    assert pub["room_id"] in own_ids, "房主暂离后仍应能从广场返回本人房间"
+    assert all("host_online" in r for r in own_rooms), "广场条目须带 host_online 供前端标注暂离"
+
+    # 督学官视角：公开小组房间可见，ai_solo 与私密房间不可见
+    rooms = client.get("/api/rooms/plaza", headers=watch1["headers"]).json()["rooms"]
     ids = {r["room_id"] for r in rooms}
-    assert pub["room_id"] in ids, "公开小组房间应出现在广场"
+    assert pub["room_id"] in ids, "公开小组房间应出现在督学官的广场"
     assert solo["room_id"] not in ids, "ai_solo 房间不应出现在广场"
     assert priv["room_id"] not in ids, "私密房间不应出现在广场"
     entry = next(r for r in rooms if r["room_id"] == pub["room_id"])
-    assert {"room_id", "host_nickname", "mode", "scene_title", "goal_text",
-            "elapsed_seconds", "watcher_count", "max_watchers"} <= set(entry)
+    assert {"room_id", "host_id", "host_nickname", "mode", "scene_title", "goal_text",
+            "elapsed_seconds", "watcher_count", "max_watchers", "host_online"} <= set(entry)
+    assert entry["host_id"] == host["user_id"]
     assert entry["watcher_count"] == 0 and entry["mode"] == "peer_group"
 
     # 满员：max_watchers=1，第一位督学官占位后第二位被 4403 拒绝
@@ -624,10 +632,27 @@ def test_ws_ai_commander_dialogue(client, monkeypatch):
         assert any("第三题" in t or "卡住" in t or "求助" in t for t in chat_chunks), \
             "chat 台词应回显求助变量：%s" % chat_chunks
 
-    # 对话历史已落房间状态（最近 8 轮内）
-    live = state_module.active_rooms.get(rid)
-    assert live is not None and len(live["dialogue_history"]) >= 2
-    assert live["dialogue_history"][-1]["trigger"] == "chat"
+        # 连接未断开时：对话历史已落房间状态（最近 8 轮内）
+        live = state_module.active_rooms.get(rid)
+        assert live is not None and len(live["dialogue_history"]) >= 2
+        assert live["dialogue_history"][-1]["trigger"] == "chat"
+
+    # 房主断开连接后：房间保留现场（暂离），仅标记离线并清空画面缓存，供稍后返回恢复
+    left = state_module.active_rooms.get(rid)
+    assert left is not None, "房主暂离不应销毁房间"
+    assert left["host_online"] is False, "房主暂离应标记 host_online=False"
+    assert left["last_frame_b64"] is None, "房主暂离应清空画面缓存（隐私零残留）"
+    assert left["dialogue_history"], "房主暂离应保留对话历史现场"
+
+    # 房主重连：标记在线，并收到 room_state_sync 现场快照（不重复开局播报）
+    with client.websocket_connect(
+        "/ws/room/%s?token=%s" % (rid, host["token"]), headers={"origin": VALID_ORIGIN}
+    ) as host_ws2:
+        sync = _recv_type(host_ws2, "room_state_sync")
+        assert sync["goal_text"] == left["goal_text"]
+        assert sync["strikes_left"] == left["strikes_left"]
+        assert isinstance(sync["dialogue_history"], list) and sync["dialogue_history"]
+        assert state_module.active_rooms.get(rid)["host_online"] is True
 
 
 # ========== 11. 战报明细与 CSV 导出（M5 收官） ==========

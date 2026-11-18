@@ -157,6 +157,8 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
         "last_frame_b64": None,
         "score_history": [],
         "watchers": {},
+        # 房主在线标记：暂离时置 False 仅保留房间，结算时才真正销毁
+        "host_online": True,
         # 哨兵上次预警时间（内部字段，不对外回显）
         "_last_sentinel_alert_ts": 0.0,
     }
@@ -168,7 +170,8 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
 # ========== REST：公告广场 ==========
 @router.get("/api/rooms/plaza")
 async def plaza(user: dict = Depends(get_current_user)):
-    """返回所有公开且非 ai_solo 的活跃房间快照"""
+    """返回所有公开、非 ai_solo 的活跃房间快照（不过滤本人房间，供房主暂离后返回）"""
+    _current_user_id(user)  # 鉴权：确保调用方已登录
     now = _now_ts()
     result = []
     for _, room in state.active_rooms.items():
@@ -178,6 +181,7 @@ async def plaza(user: dict = Depends(get_current_user)):
             continue
         result.append({
             "room_id": room.get("room_id"),
+            "host_id": room.get("host_id"),
             "host_nickname": room.get("host_nickname", ""),
             "mode": room.get("mode"),
             "scene_title": room.get("scene_title", ""),
@@ -185,6 +189,7 @@ async def plaza(user: dict = Depends(get_current_user)):
             "elapsed_seconds": max(0, int(now - (room.get("created_at") or now))),
             "watcher_count": len(room.get("watchers") or {}),
             "max_watchers": room.get("max_watchers", 0),
+            "host_online": bool(room.get("host_online", True)),
         })
     return {"rooms": result}
 
@@ -209,6 +214,30 @@ async def snapshot(room_id: str, user: dict = Depends(get_current_user)):
     if not content:
         raise HTTPException(status_code=404, detail="暂无画面")
     return Response(content=content, media_type="image/jpeg")
+
+
+# ========== REST：房间元信息（督学官进入校验归属） ==========
+@router.get("/api/rooms/{room_id}")
+async def room_meta(room_id: str, user: dict = Depends(get_current_user)):
+    """返回房间元信息与现场快照：供督学官校验归属，也供房主暂离后恢复现场；不存在返回 404"""
+    room = state.active_rooms.get(room_id)
+    if not isinstance(room, dict):
+        raise HTTPException(status_code=404, detail="房间不存在")
+    return {
+        "room_id": room.get("room_id"),
+        "host_id": room.get("host_id"),
+        "host_nickname": room.get("host_nickname", ""),
+        "scene_title": room.get("scene_title", ""),
+        "goal_text": room.get("goal_text", ""),
+        "mode": room.get("mode"),
+        "is_public": room.get("is_public"),
+        # 暂离/返回闭环所需现场字段
+        "host_online": bool(room.get("host_online", True)),
+        "scene_config": room.get("scene_config", {}),
+        "strikes_left": room.get("strikes_left", 3),
+        "is_locked": bool(room.get("is_locked", False)),
+        "active_punishment": room.get("active_punishment", ""),
+    }
 
 
 # ========== 广播工具 ==========
@@ -437,10 +466,29 @@ async def room_ws(websocket: WebSocket, room_id: str):
     await _notify_watcher_update(room_id, room)
     loop = asyncio.get_running_loop()
 
-    # 开局领命：房主首次连入触发一次 proactive 流式对话（用房间级标记防重连重复触发）
-    if is_host and not room.get("_proactive_sent"):
-        room["_proactive_sent"] = True
-        await _broadcast_dialogue(room_id, room, "proactive")
+    if is_host:
+        # 房主连入即视为在线（暂离重连会由此恢复在线标记）
+        room["host_online"] = True
+        # 分流：已开过局（有历史对话或已发过开局播报）认定为暂离重连，恢复现场而非重复开局
+        has_history = bool(room.get("dialogue_history"))
+        if room.get("_proactive_sent") or has_history:
+            # 向本房主单发现场快照，恢复目标/机会/锁房/惩罚/场景与历史对话
+            await _send_to(room_id, user_id, {
+                "type": "room_state_sync",
+                "goal_text": room.get("goal_text", ""),
+                "strikes_left": room.get("strikes_left", 3),
+                "is_locked": bool(room.get("is_locked", False)),
+                "active_punishment": room.get("active_punishment", ""),
+                "scene_config": room.get("scene_config", {}),
+                "dialogue_history": room.get("dialogue_history", []),
+            })
+            # 仅向在线督学官广播房主已返回（排除房主本人）
+            await _broadcast(room_id, {"type": "host_status", "online": True},
+                             exclude_user_id=user_id)
+        else:
+            # 首次连入：触发一次 proactive 流式对话（房间级标记防重连重复触发）
+            room["_proactive_sent"] = True
+            await _broadcast_dialogue(room_id, room, "proactive")
 
     try:
         while True:
@@ -533,6 +581,10 @@ async def room_ws(websocket: WebSocket, room_id: str):
                         state.room_connections.pop(room_id, None)
                     state._inflight_students.discard(user_id)
                     break
+
+                elif mtype == "leave_room":
+                    # 房主暂时离席：跳出循环，由 finally 标记离线并广播 host_status（房间保留）
+                    break
             else:
                 # ===== 督学官消息 =====
                 if mtype == "barrage":
@@ -550,13 +602,33 @@ async def room_ws(websocket: WebSocket, room_id: str):
                             "from": nickname, "sound": sound,
                         })
     finally:
-        # 断开收尾：移除连接，督学官离开时同步通知房主
-        with state.room_connections_lock:
-            conns = state.room_connections.get(room_id, {})
-            conns.pop(user_id, None)
-            if not conns:
-                state.room_connections.pop(room_id, None)
-        if not is_host:
+        # 断开收尾：区分「结算销毁」与「暂离保留」两条路径
+        if is_host:
+            # 结算路径已在 finish_session 中 pop 房间并广播 session_finished，此处房间已不存在，无需再处理
+            if state.active_rooms.get(room_id) is room:
+                # 暂离路径：仅标记房主离线、清空画面缓存，房间与场景/惩罚/对话等现场完整保留
+                room["host_online"] = False
+                room["last_frame_b64"] = None
+                # 向仍在线的督学官广播房主暂离（不主动断开督学官连接，待房主返回恢复）
+                if room.get("watchers"):
+                    await _broadcast(room_id, {
+                        "type": "host_status",
+                        "online": False,
+                        "msg": "房主暂时离开，稍后回来",
+                    }, exclude_user_id=user_id)
+            # 仅从连接表移除房主自身连接，保留房间与督学官连接供重连恢复
+            with state.room_connections_lock:
+                conns = state.room_connections.get(room_id, {})
+                conns.pop(user_id, None)
+                if not conns:
+                    state.room_connections.pop(room_id, None)
+        else:
+            # 督学官断开：移除连接与 watcher 记录，同步通知房主最新名单
+            with state.room_connections_lock:
+                conns = state.room_connections.get(room_id, {})
+                conns.pop(user_id, None)
+                if not conns:
+                    state.room_connections.pop(room_id, None)
             (room.get("watchers") or {}).pop(user_id, None)
             await _notify_watcher_update(room_id, room)
         state._inflight_students.discard(user_id)

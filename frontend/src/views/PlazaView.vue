@@ -150,7 +150,9 @@ function modeLabel(mode: RoomMode): string {
   return map[mode] ?? mode
 }
 
-/** 加载广场房间列表（不打断轮询时保留旧数据） */
+/**
+ * 加载广场房间列表：后端已不过滤本人房间，前端同样保留，供房主暂离后返回。
+ */
 async function loadPlaza(): Promise<void> {
   try {
     const res = await roomApi.plaza()
@@ -163,9 +165,20 @@ async function loadPlaza(): Promise<void> {
   }
 }
 
-/** 进入督学：跳转到监督界面（督学官视角） */
+/** 是否为本人房间（房主本人暂离后仍显示在广场，标注为可返回） */
+function isMyRoom(room: PlazaRoom): boolean {
+  return room.host_id === userStore.profile?.id
+}
+
+/**
+ * 进入房间：本人房间跳学习室（继续/恢复本局），他人房间跳督学视角。
+ */
 function enterWatch(room: PlazaRoom): void {
-  router.push({ name: 'watch', params: { roomId: room.room_id } })
+  if (isMyRoom(room)) {
+    router.push({ name: 'study', params: { roomId: room.room_id } })
+  } else {
+    router.push({ name: 'watch', params: { roomId: room.room_id } })
+  }
 }
 
 /** 退出登录 */
@@ -322,16 +335,26 @@ onBeforeUnmount(() => {
         <p v-else-if="rooms.length === 0" class="hint">当前暂无公开房间，成为第一个开房的人吧。</p>
 
         <div v-else class="room-grid">
-          <article v-for="room in rooms" :key="room.room_id" class="room-card">
-            <div class="room-mode">{{ modeLabel(room.mode) }}</div>
+          <article
+            v-for="room in rooms"
+            :key="room.room_id"
+            class="room-card"
+            :class="{ 'room-card--mine': isMyRoom(room) }"
+          >
+            <div class="room-mode">
+              {{ isMyRoom(room) ? '我的进行中房间' : modeLabel(room.mode) }}
+              <span v-if="isMyRoom(room) && !room.host_online" class="room-away">暂离中</span>
+            </div>
             <h3 class="room-title">{{ room.scene_title }}</h3>
             <p class="room-goal">{{ room.goal_text }}</p>
             <div class="room-meta">
-              <span>房主：{{ room.host_nickname }}</span>
+              <span>房主：{{ isMyRoom(room) ? '我' : room.host_nickname }}</span>
               <span>已坚持 {{ room.elapsed_seconds }} 秒</span>
               <span>在线督学 {{ room.watcher_count }}/{{ room.max_watchers }}</span>
             </div>
-            <button type="button" class="enter-btn" @click="enterWatch(room)">进入督学</button>
+            <button type="button" class="enter-btn" @click="enterWatch(room)">
+              {{ isMyRoom(room) ? '返回学习室' : '进入督学' }}
+            </button>
           </article>
         </div>
       </section>
@@ -612,6 +635,18 @@ onBeforeUnmount(() => {
   background: rgba(5, 20, 34, 0.8);
   border: 1px solid rgba(0, 229, 255, 0.2);
   border-radius: 10px;
+}
+.room-card--mine {
+  border-color: rgba(255, 214, 102, 0.6);
+  background: rgba(40, 32, 10, 0.7);
+}
+.room-away {
+  margin-left: 6px;
+  font-size: 10px;
+  color: #ffb020;
+  border: 1px solid rgba(255, 176, 32, 0.5);
+  border-radius: 999px;
+  padding: 1px 8px;
 }
 .room-mode {
   display: inline-block;

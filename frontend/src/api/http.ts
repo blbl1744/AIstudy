@@ -11,6 +11,7 @@ import type {
   RegisterRequest,
   RegisterResponse,
   RoomDetail,
+  RoomMeta,
   SceneConfig,
   SessionDetail,
   UserProfile,
@@ -91,6 +92,9 @@ export const roomApi = {
     http.post<RoomDetail>('/rooms', payload).then((res) => res.data),
   plaza: (): Promise<{ rooms: PlazaRoom[] }> =>
     http.get<{ rooms: PlazaRoom[] }>('/rooms/plaza').then((res) => res.data),
+  /** 房间元信息：进入监督页前校验房主归属，不存在返回 404 */
+  meta: (roomId: string): Promise<RoomMeta> =>
+    http.get<RoomMeta>(`/rooms/${encodeURIComponent(roomId)}`).then((res) => res.data),
   /** 房主实时快照地址（受鉴权保护，img 标签直接引用即可随请求带 Token 需另行处理） */
   snapshotUrl: (roomId: string): string => `/api/rooms/${roomId}/snapshot.jpg`,
 }

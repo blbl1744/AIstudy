@@ -9,7 +9,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { getToken } from '@/api/http'
+import { getToken, roomApi } from '@/api/http'
 import { useUserStore } from '@/stores/user'
 import { useRoomStore } from '@/stores/room'
 import { useSceneStore } from '@/stores/scene'
@@ -32,8 +32,25 @@ const currentRoomId = computed(() => {
 
 // ===== 一、场景恢复：优先内存态，其次房间详情，最后退回预设首项 =====
 const sceneForRender = computed(() => sceneStore.activeScene)
-const goalText = computed(() => roomStore.roomDetail?.goal_text ?? '暂无学习目标（请从督学广场重新进入本局）')
+// 目标文本优先取现场恢复值，其次取房间详情，避免刷新/暂离回来后目标丢失
+const goalText = computed(() =>
+  roomStore.goalText || roomStore.roomDetail?.goal_text || '暂无学习目标（请从督学广场重新进入本局）',
+)
 const sceneTitle = computed(() => sceneStore.activeScene?.scene_title ?? '督学战场')
+
+/**
+ * 挂载时拉取房间现场元信息：恢复目标、剩余机会、锁房、惩罚与场景配置。
+ * 房间已被结算/回收（404）时保留空态，交由连接失败提示处理，不阻塞渲染。
+ */
+async function restoreFromMeta(): Promise<void> {
+  try {
+    const meta = await roomApi.meta(currentRoomId.value)
+    roomStore.applyRoomMeta(meta)
+    if (meta.scene_config) sceneStore.setActiveScene(meta.scene_config)
+  } catch {
+    // 房间不存在或接口异常时忽略，场景回退逻辑由 ensureScene 兜底
+  }
+}
 
 async function ensureScene(): Promise<void> {
   if (sceneStore.activeScene) return
@@ -131,7 +148,10 @@ const report = ref<BattleReport | null>(null)
 const finishError = ref('')
 let wsUnsubscribers: Array<() => void> = []
 
-/** 返回广场：释放摄像头、清空房间态并跳转 */
+/**
+ * 暂时返回广场：只停推、断开连接并清空本地房间态，不结算、不销毁房间。
+ * 后端在房主断开时标记暂离并保留现场，稍后可从广场「返回学习室」恢复本局。
+ */
 function backToPlaza(): void {
   stopCamera()
   roomStore.reset()
@@ -158,9 +178,10 @@ async function confirmReport(): Promise<void> {
 }
 
 onMounted(() => {
-  void ensureScene()
+  // 先恢复现场（目标/场景/惩罚等），再建立连接；连接建立后 room_state_sync 会二次校准
+  void restoreFromMeta().then(() => ensureScene())
   const ws = roomStore.createSocket(() => getToken(), currentRoomId.value)
-  // 在连接前订阅战报：store 仅将 session_finished 用于解锁，完整字段在此消费
+  // 在连接前订阅：store 内部消费 room_state_sync 恢复进度，此处据其场景配置还原渲染场景
   wsUnsubscribers.push(
     ws.on('session_finished', (msg) => {
       stopCamera()
@@ -172,6 +193,10 @@ onMounted(() => {
         streak_clean_sessions: msg.streak_clean_sessions,
         shield_count: msg.shield_count,
       }
+    }),
+    ws.on('room_state_sync', (msg) => {
+      // 房主重连：以服务端现场为准还原场景（进度与历史对话由 roomStore 恢复）
+      if (msg.scene_config) sceneStore.setActiveScene(msg.scene_config)
     }),
   )
   ws.connect()
@@ -197,7 +222,7 @@ onBeforeUnmount(() => {
           </div>
           <div class="topbar-actions">
             <span class="scene-name">{{ sceneTitle }}</span>
-            <button type="button" class="top-btn top-btn--ghost" @click="backToPlaza">退出房间</button>
+            <button type="button" class="top-btn top-btn--ghost" @click="backToPlaza">暂时返回广场</button>
             <button type="button" class="top-btn top-btn--primary" @click="finishSession">结束本局并结算</button>
           </div>
         </header>

@@ -169,6 +169,7 @@ export interface RoomDetail {
 /** 公告广场房间条目（GET /api/rooms/plaza） */
 export interface PlazaRoom {
   room_id: string
+  host_id: number
   host_nickname: string
   mode: RoomMode
   scene_title: string
@@ -176,6 +177,26 @@ export interface PlazaRoom {
   elapsed_seconds: number
   watcher_count: number
   max_watchers: number
+  /** 房主是否在线：false 表示房主暂离但房间仍保留，供本人「返回学习室」 */
+  host_online: boolean
+}
+
+/** 房间元信息（GET /api/rooms/{room_id}），供督学官校验归属，也供房主暂离后恢复现场 */
+export interface RoomMeta {
+  room_id: string
+  host_id: number
+  host_nickname: string
+  scene_title: string
+  goal_text: string
+  mode: RoomMode
+  is_public: boolean
+  /** 房主在线标记：暂离为 false，重连恢复为 true */
+  host_online: boolean
+  /** 当前挂载剧本，供重返恢复场景 */
+  scene_config: SceneConfig
+  strikes_left: number
+  is_locked: boolean
+  active_punishment: string
 }
 
 // ===== WebSocket 消息契约（按 type 字段做可辨识联合，实现强类型分发） =====
@@ -223,6 +244,11 @@ export interface WsPingMsg {
   type: 'ping'
 }
 
+/** 客户端上行：房主主动离开房间（后端据此销毁房间与画面缓存） */
+export interface WsLeaveRoomMsg {
+  type: 'leave_room'
+}
+
 /** 客户端上行消息联合类型 */
 export type WsOutgoingMsg =
   | WsFrameMsg
@@ -232,6 +258,7 @@ export type WsOutgoingMsg =
   | WsSoundEffectMsg
   | WsFinishSessionMsg
   | WsPingMsg
+  | WsLeaveRoomMsg
 
 /** 服务端下行：姿态分析结果 */
 export interface WsAnalysisUpdateMsg {
@@ -328,6 +355,37 @@ export interface WsSessionFinishedMsg {
   shield_count: number
 }
 
+/** 服务端下行：房主离开导致房间关闭（保留类型兼容，暂离改用 host_status） */
+export interface WsRoomClosedMsg {
+  type: 'room_closed'
+  msg: string
+}
+
+/** 服务端下行：房主在线状态变化（暂离 / 返回），推送给在线督学官 */
+export interface WsHostStatusMsg {
+  type: 'host_status'
+  online: boolean
+  msg?: string
+}
+
+/** 指挥官历史对话条目，结构对齐后端 ai_commander 的 dialogue_history */
+export interface DialogueHistoryItem {
+  trigger: string
+  user_input: string
+  text: string
+}
+
+/** 服务端下行：房主重连后的现场快照，恢复目标 / 机会 / 锁房 / 惩罚 / 场景与历史对话 */
+export interface WsRoomStateSyncMsg {
+  type: 'room_state_sync'
+  goal_text: string
+  strikes_left: number
+  is_locked: boolean
+  active_punishment: string
+  scene_config: SceneConfig
+  dialogue_history: DialogueHistoryItem[]
+}
+
 /** 服务端下行消息联合类型 */
 export type WsIncomingMsg =
   | WsAnalysisUpdateMsg
@@ -343,6 +401,9 @@ export type WsIncomingMsg =
   | WsWatcherUpdateMsg
   | WsRoomLockedMsg
   | WsSessionFinishedMsg
+  | WsRoomClosedMsg
+  | WsHostStatusMsg
+  | WsRoomStateSyncMsg
 
 /** 服务端下行消息的 type 字段联合，供事件总线键类型约束 */
 export type WsIncomingType = WsIncomingMsg['type']

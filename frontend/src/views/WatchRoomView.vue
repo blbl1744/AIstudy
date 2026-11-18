@@ -8,10 +8,10 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import http, { getToken } from '@/api/http'
+import http, { getToken, roomApi } from '@/api/http'
 import { RoomSocket } from '@/api/roomSocket'
 import { useUserStore } from '@/stores/user'
-import type { SoundEffect } from '@/types'
+import type { RoomMeta, SoundEffect } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -26,10 +26,13 @@ const myName = computed(() => userStore.nickname || '我')
 const snapshotUrl = ref('')
 const hasFrame = ref(false)
 const waitingHost = ref(true)
+const hostAway = ref(false) // 房主暂离：暂停轮询并在画面区提示等待返回
 let pollTimer: number | null = null
 
 /** 拉取一帧受鉴权快照；请求经 http 客户端自动携带 Bearer Token */
 async function pollSnapshot(): Promise<void> {
+  // 房主暂离期间服务端已清空画面，停止拉取并保留等待提示
+  if (hostAway.value) return
   try {
     const res = await http.get<Blob>(`/rooms/${encodeURIComponent(roomId.value)}/snapshot.jpg`, {
       responseType: 'blob',
@@ -54,6 +57,20 @@ async function pollSnapshot(): Promise<void> {
   }
 }
 
+/** 启动画面轮询（首帧立即拉取），供挂载与房主返回时调用 */
+function startPolling(): void {
+  void pollSnapshot()
+  if (pollTimer === null) pollTimer = window.setInterval(() => { void pollSnapshot() }, 1500)
+}
+
+/** 停止画面轮询，供房主暂离与组件卸载时调用 */
+function stopPolling(): void {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
 // ===== 二、哨兵预警横幅（纯文本插值 + CSS 闪烁） =====
 const sentinelMsg = ref('')
 const sentinelVisible = ref(false)
@@ -62,6 +79,18 @@ let sentinelTimer: number | null = null
 // ===== 三、房间结束与断连提示 =====
 const sessionEnded = ref(false)
 const connectionLost = ref(false)
+// 校验拦截：本人房间不可自监、房间已关闭（房主离开）时提示并返回广场
+const blockedReason = ref('')
+let redirectTimer: number | null = null
+
+/** 显示拦截提示并在短暂延时后返回广场，避免用户停留在无效房间 */
+function blockAndLeave(reason: string): void {
+  blockedReason.value = reason
+  // 停掉快照轮询，避免房间销毁后继续无效请求
+  stopPolling()
+  if (redirectTimer !== null) window.clearTimeout(redirectTimer)
+  redirectTimer = window.setTimeout(() => { void router.replace('/plaza') }, 2200)
+}
 
 // ===== 四、互动记录（本地已发送 + 服务端广播，含轻量去重） =====
 interface InteractionItem {
@@ -152,12 +181,35 @@ function backToPlaza(): void {
   router.push('/plaza')
 }
 
-onMounted(() => {
+onMounted(async () => {
+  // 进入前先拉房间元信息校验归属：不允许以督学官身份监督自己的房间
+  let meta: RoomMeta
+  try {
+    meta = await roomApi.meta(roomId.value)
+  } catch {
+    // 房间不存在或已销毁（如房主已离开），直接提示并返回广场
+    blockAndLeave('该房间不存在或已关闭，即将返回督学广场')
+    return
+  }
+  // 以 profile?.id 作为当前用户唯一标识（与 userStore 契约一致）；档案异步加载时先等待就绪
+  if (!userStore.profile) {
+    try {
+      await userStore.fetchProfile()
+    } catch {
+      // 档案拉取失败不阻塞：仅凭已有信息比对，无法确定本人时放行由后端兜底
+    }
+  }
+  if (userStore.profile && meta.host_id === userStore.profile.id) {
+    // 房主本人误入监督页：自动切回学习室继续/恢复本局，而非拦截为错误
+    await router.replace(`/study/${encodeURIComponent(roomId.value)}`)
+    return
+  }
+
   socket = new RoomSocket({
     roomId: roomId.value,
     getToken,
     onOpen: () => { if (!sessionEnded.value) connectionLost.value = false },
-    onClose: () => { if (!sessionEnded.value) connectionLost.value = true },
+    onClose: () => { if (!sessionEnded.value && !blockedReason.value) connectionLost.value = true },
   })
   unsubscribers.push(
     socket.on('sentinel_alert', (msg) => {
@@ -180,17 +232,40 @@ onMounted(() => {
       sentinelMsg.value = msg.msg
       sentinelVisible.value = true
     }),
+    // 房主离开导致房间关闭：提示并自动返回广场
+    socket.on('room_closed', (msg) => {
+      sessionEnded.value = true
+      connectionLost.value = false
+      blockAndLeave(msg.msg || '房主已离开学习室，房间已关闭')
+    }),
+    // 房主暂离/返回：暂离停轮询并在画面区提示等待，返回后自动恢复轮询
+    socket.on('host_status', (msg) => {
+      if (msg.online === false) {
+        hostAway.value = true
+        hasFrame.value = false
+        waitingHost.value = false
+        if (snapshotUrl.value) {
+          URL.revokeObjectURL(snapshotUrl.value)
+          snapshotUrl.value = ''
+        }
+        stopPolling()
+      } else if (msg.online === true) {
+        hostAway.value = false
+        waitingHost.value = true
+        startPolling()
+      }
+    }),
   )
   socket.connect()
-  void pollSnapshot()
-  pollTimer = window.setInterval(() => { void pollSnapshot() }, 1500)
+  startPolling()
 })
 
 onBeforeUnmount(() => {
-  if (pollTimer !== null) {
-    window.clearInterval(pollTimer)
-    pollTimer = null
+  if (redirectTimer !== null) {
+    window.clearTimeout(redirectTimer)
+    redirectTimer = null
   }
+  stopPolling()
   if (sentinelTimer !== null) {
     window.clearTimeout(sentinelTimer)
     sentinelTimer = null
@@ -226,7 +301,8 @@ onBeforeUnmount(() => {
         <div class="panel-head">实时学习画面</div>
         <div class="screen-frame">
           <img v-if="hasFrame" :src="snapshotUrl" alt="学习者实时画面快照" class="screen-img" />
-          <div v-if="waitingHost" class="screen-placeholder">等待房主开启摄像头推流…</div>
+          <div v-if="hostAway" class="screen-placeholder screen-placeholder--away">房主暂时离开，等待返回…</div>
+          <div v-else-if="waitingHost" class="screen-placeholder">等待房主开启摄像头推流…</div>
         </div>
         <p class="screen-hint">画面为受鉴权快照，每 1.5 秒刷新，不在本地留存</p>
       </section>
@@ -292,8 +368,18 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
+    <!-- 校验拦截 / 房间关闭提示：明确原因并引导返回广场，纯文本插值 -->
+    <div v-if="blockedReason" class="ended-mask">
+      <div class="ended-card">
+        <div class="ended-badge">无法监督</div>
+        <h2>监督未开启</h2>
+        <p>{{ blockedReason }}</p>
+        <button type="button" class="ended-btn" @click="backToPlaza">返回督学广场</button>
+      </div>
+    </div>
+
     <!-- 房主结束本局：明确提示并引导返回广场 -->
-    <div v-if="sessionEnded" class="ended-mask">
+    <div v-if="sessionEnded && !blockedReason" class="ended-mask">
       <div class="ended-card">
         <div class="ended-badge">监督结束</div>
         <h2>房主已结束本局并完成结算</h2>
@@ -388,6 +474,11 @@ onBeforeUnmount(() => {
   justify-content: center;
   font-size: 14px;
   color: #8aa4c0;
+}
+.screen-placeholder--away {
+  color: #ffd666;
+  font-size: 16px;
+  font-weight: 600;
 }
 .screen-hint { margin: 12px 0 0; font-size: 12px; color: #8aa4c0; }
 

@@ -9,7 +9,9 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 
 # ---- 视觉与姿态识别（摄像头专注度检测） ----
-mediapipe>=0.10.14
+# mediapipe 0.10.21+ 移除了 mp.solutions（pose/face_mesh），改用 tasks API，
+# 会导致 analyzer 启动期 AttributeError；故锁定上限保留 solutions 且兼容 Py3.12。
+mediapipe>=0.10.14,<0.10.21
 opencv-python>=4.10.0
 
 # ---- 数值与机器学习（专注度预测模型） ----
