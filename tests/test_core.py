@@ -500,6 +500,21 @@ def test_scene_presets_and_compile_cache(client, monkeypatch):
     # 直接核对缓存表已落库（归一化后的 JSON）
     assert sg.get_cached_scene("魔法学院奇遇记")
 
+    # 5) 自定义作品移植：建房携带 work_name 时应优先编译并挂载 scene_config，
+    #    元接口 GET /api/rooms/{id} 原样返回该剧本包（离线路径避免依赖外部 Key）
+    monkeypatch.setattr(sg, "LLM_API_KEY", "")
+    mount_resp = client.post("/api/rooms", json={
+        "mode": "ai_solo", "goal_text": "验证场景移植挂载", "work_name": "三体黑暗森林",
+    }, headers=host["headers"])
+    assert mount_resp.status_code == 200, mount_resp.text
+    mounted_room = mount_resp.json()
+    mounted_scene = mounted_room["scene_config"]
+    assert mounted_scene.get("source_work") == "三体黑暗森林", "work_name 应优先编译并挂载 source_work"
+    assert mounted_scene.get("scene_id") and mounted_scene.get("commander_title")
+    meta_resp = client.get("/api/rooms/%s" % mounted_room["room_id"], headers=host["headers"])
+    assert meta_resp.status_code == 200, meta_resp.text
+    assert meta_resp.json()["scene_config"] == mounted_scene, "元接口应原样返回挂载的 scene_config"
+
 
 # ========== 9. 三次机会、护盾抵消与建设性惩罚解锁 ==========
 def test_three_strikes_shield_and_punishment(client, monkeypatch):
@@ -652,6 +667,7 @@ def test_ws_ai_commander_dialogue(client, monkeypatch):
         assert sync["goal_text"] == left["goal_text"]
         assert sync["strikes_left"] == left["strikes_left"]
         assert isinstance(sync["dialogue_history"], list) and sync["dialogue_history"]
+        assert sync["scene_config"] == left["scene_config"], "room_state_sync 应原样返回挂载的 scene_config"
         assert state_module.active_rooms.get(rid)["host_online"] is True
 
 

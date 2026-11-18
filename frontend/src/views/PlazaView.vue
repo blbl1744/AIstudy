@@ -35,8 +35,15 @@ function selectMode(mode: RoomMode): void {
 }
 
 // ===== 二、场景选择（预设 + 自定义作品编译） =====
+/** 场景来源：preset=内置预设，custom=作品名编译移植，决定建房传参与预览卡片 */
+type SceneMode = 'preset' | 'custom'
+const sceneMode = ref<SceneMode>('preset')
 const customWork = ref('')
 const sceneError = ref('')
+/** 最近一次编译移植得到的剧本，仅用于预览卡片，避免与预设激活态混淆 */
+const compiledWork = ref<SceneConfig | null>(null)
+/** 是否为离线兜底剧本：编译结果的 scene_id 命中内置预设即为智能匹配相近主题 */
+const compiledIsFallback = ref(false)
 
 /** 加载内置预设，并在尚无激活场景时默认选中第一个 */
 async function loadScenes(): Promise<void> {
@@ -50,13 +57,16 @@ async function loadScenes(): Promise<void> {
   }
 }
 
-/** 点击预设卡片选中该场景 */
+/** 点击预设卡片选中该场景，切回预设来源并清空移植预览 */
 function selectScene(scene: SceneConfig): void {
   sceneStore.setActiveScene(scene)
+  sceneMode.value = 'preset'
+  compiledWork.value = null
+  compiledIsFallback.value = false
   sceneError.value = ''
 }
 
-/** 编译自定义作品名并设为激活场景（带加载态） */
+/** 编译自定义作品名并设为激活场景（带加载态），成功后切到移植来源并渲染预览卡片 */
 async function compileCustom(): Promise<void> {
   const name = customWork.value.trim()
   if (!name) {
@@ -65,7 +75,12 @@ async function compileCustom(): Promise<void> {
   }
   sceneError.value = ''
   try {
-    await sceneStore.compileScene(name)
+    // compileScene 内部已将编译结果设为 activeScene，此处拿返回值驱动预览卡片
+    const scene = await sceneStore.compileScene(name)
+    compiledWork.value = scene
+    sceneMode.value = 'custom'
+    // scene_id 命中内置预设说明走了关键词匹配的离线兜底剧本
+    compiledIsFallback.value = sceneStore.presets.some((preset) => preset.scene_id === scene.scene_id)
   } catch {
     sceneError.value = '作品编译失败，请更换作品名重试'
   }
@@ -113,12 +128,16 @@ async function startRoom(): Promise<void> {
   createError.value = ''
   creating.value = true
   const scene = sceneStore.activeScene
+  // 自定义移植模式携带作品名与已编译 scene_id，让后端直接挂载刚编译的 SceneConfig，
+  // 避免 _resolve_scene_config 在无 work_name 时回退默认预设；预设模式则不传作品名
+  const isCustom = sceneMode.value === 'custom'
+  const workName = isCustom ? (compiledWork.value?.source_work || customWork.value.trim()) : ''
   try {
     const room = await roomStore.createRoom({
       mode: selectedMode.value,
       is_public: isPublic.value,
       scene_id: scene.scene_id,
-      work_name: scene.source_work,
+      work_name: workName,
       scene_title: scene.scene_title,
       goal_text: goalText.value.trim(),
       max_watchers: selectedMode.value === 'peer_group' ? maxWatchers.value : 1,
@@ -279,6 +298,27 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="sceneStore.activeScene" class="active-scene">
             当前场景：{{ sceneStore.activeScene.scene_title }} · {{ sceneStore.activeScene.commander_title }}
+          </div>
+          <!-- 自定义作品移植预览卡片：高亮展示刚编译的剧本包 -->
+          <div v-if="sceneMode === 'custom' && compiledWork" class="compiled-preview">
+            <div class="compiled-preview__head">
+              <span class="compiled-preview__badge">已移植剧本预览</span>
+              <span class="compiled-preview__work">《{{ compiledWork.source_work }}》</span>
+            </div>
+            <div class="compiled-preview__body">
+              <span
+                class="compiled-preview__swatch"
+                :style="{ background: compiledWork.theme.bg_gradient, borderColor: compiledWork.theme.primary_color }"
+              ></span>
+              <div class="compiled-preview__meta">
+                <div class="compiled-preview__scene">{{ compiledWork.scene_title }}</div>
+                <div class="compiled-preview__commander">指挥官：{{ compiledWork.commander_title }}</div>
+                <div class="compiled-preview__opening">「{{ compiledWork.opening_line }}」</div>
+              </div>
+            </div>
+            <p v-if="compiledIsFallback" class="compiled-preview__fallback">
+              当前未配置大模型 Key，已智能匹配相近主题剧本
+            </p>
           </div>
           <p v-if="sceneError" class="error-hint">{{ sceneError }}</p>
         </div>
@@ -570,6 +610,69 @@ onBeforeUnmount(() => {
   margin-top: 10px;
   font-size: 12px;
   color: #7fe9c0;
+}
+
+/* 自定义作品移植预览卡片：高亮边框 + 主题色块 */
+.compiled-preview {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(0, 229, 255, 0.55);
+  border-radius: 10px;
+  background: rgba(0, 229, 255, 0.08);
+  box-shadow: 0 0 18px rgba(0, 229, 255, 0.18);
+}
+.compiled-preview__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.compiled-preview__badge {
+  font-size: 11px;
+  color: #04121a;
+  background: #00e5ff;
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+.compiled-preview__work {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6f1ff;
+}
+.compiled-preview__body {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+.compiled-preview__swatch {
+  flex: 0 0 72px;
+  min-height: 72px;
+  border-radius: 8px;
+  border: 2px solid #00e5ff;
+}
+.compiled-preview__meta {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: #b9cde2;
+}
+.compiled-preview__scene {
+  font-size: 14px;
+  font-weight: 600;
+  color: #7fe9c0;
+  margin-bottom: 4px;
+}
+.compiled-preview__commander {
+  margin-bottom: 4px;
+}
+.compiled-preview__opening {
+  color: #c7d8ea;
+  line-height: 1.6;
+}
+.compiled-preview__fallback {
+  margin: 10px 0 0;
+  font-size: 11px;
+  color: #ffd666;
 }
 
 .goal-input {
