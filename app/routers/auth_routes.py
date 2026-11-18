@@ -1,12 +1,13 @@
 """
-路由层 · 认证：学生/教师注册、登录、当前用户信息（/api/me）。"""
-import sqlite3
+路由层 · 统一认证与个人成长接口（M1-A）。
 
+提供注册、登录、个人档案查询与个人数据清空，不再区分师生角色。
+"""
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import (
     LoginRequest,
-    StudentRegisterRequest,
+    RegisterRequest,
     _clear_login_failures,
     _raise_if_login_locked,
     _record_login_failure,
@@ -17,109 +18,77 @@ from ..auth import (
     upgrade_password_hash,
     verify_password,
 )
-from ..db import create_student, get_db, get_student_by_username, get_teacher_by_username
+from ..db import (
+    create_user,
+    delete_user_learning_data,
+    get_user_by_username,
+    get_user_profile,
+)
+from ..state import clear_user_room_cache
 
 router = APIRouter()
 
 
-# --- 学生注册 ---
-@router.post("/api/student/register")
-async def student_register(request: StudentRegisterRequest):
-    if len(request.username) < 3 or len(request.password) < 6:
-        raise HTTPException(status_code=400, detail="用户名至少3位，密码至少6位")
-    if not request.name.strip():
-        raise HTTPException(status_code=400, detail="请输入真实姓名")
+def _current_user_id(user: dict) -> int:
+    """从 JWT 载荷取统一账号 ID；缺失则视为无效凭证"""
+    user_id = user.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="无效的Token")
+    return user_id
 
-    student_id = create_student(request.username, request.password, request.name, request.student_no, request.class_name)
-    if student_id is None:
+
+@router.post("/api/auth/register")
+async def register(request: RegisterRequest):
+    """统一注册：用户名、密码、昵称（昵称已由模型做 XSS 字符白名单校验）"""
+    user_id = create_user(request.username, request.password, request.nickname)
+    if user_id is None:
         raise HTTPException(status_code=400, detail="用户名已存在")
+    return {"message": "注册成功", "user_id": user_id}
 
-    return {"message": "注册成功", "student_id": student_id}
 
-# --- 教师注册 ---
-@router.post("/api/teacher/register")
-async def teacher_register(request: LoginRequest):
-    """教师注册"""
-    if len(request.username) < 3 or len(request.password) < 6:
-        raise HTTPException(status_code=400, detail="用户名至少3位，密码至少6位")
-    
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO teachers (username, password_hash) VALUES (?, ?)",
-                (request.username, hash_password(request.password))
-            )
-            teacher_id = cursor.lastrowid
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="用户名已存在")
-    return {"message": "注册成功", "teacher_id": teacher_id}
+@router.post("/api/auth/login")
+async def login(request: LoginRequest):
+    """统一登录：失败限速 + bcrypt 校验 + 签发无角色 JWT"""
+    _raise_if_login_locked(request.username)
 
-# --- 学生登录 ---
-@router.post("/api/student/login")
-async def student_login(request: LoginRequest):
-    # P0-4：失败次数达到上限则直接拒绝（HTTP 429）
-    _raise_if_login_locked("student", request.username)
-
-    student = get_student_by_username(request.username)
-    if not student or not verify_password(request.password, student["password_hash"]):
-        _record_login_failure("student", request.username)
+    user = get_user_by_username(request.username)
+    if not user or not verify_password(request.password, user["password_hash"]):
+        _record_login_failure(request.username)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
-    # 登录成功：清零失败计数
-    _clear_login_failures("student", request.username)
+    _clear_login_failures(request.username)
+    # 历史 SHA256 哈希校验通过后，立即原地升级为 bcrypt
+    if not is_bcrypt_hash(user["password_hash"]):
+        upgrade_password_hash(user["id"], hash_password(request.password))
 
-    # P0-4：历史 SHA256 哈希校验通过后，立即原地升级为 bcrypt
-    if not is_bcrypt_hash(student["password_hash"]):
-        upgrade_password_hash("student", student["id"], hash_password(request.password))
-
-    token = create_jwt_token(student["id"], "student", request.username)
+    token = create_jwt_token(user["id"], user["username"], user["nickname"])
     return {
         "access_token": token,
         "token_type": "bearer",
-        "username": request.username,
-        "name": student["name"],
-        "role": "student",
-        "student_id": student["id"]
+        "user_id": user["id"],
+        "username": user["username"],
+        "nickname": user["nickname"],
     }
 
-# --- 教师登录 ---
-@router.post("/api/teacher/login")
-async def teacher_login(request: LoginRequest):
-    # P0-4：失败次数达到上限则直接拒绝（HTTP 429）
-    _raise_if_login_locked("teacher", request.username)
 
-    teacher = get_teacher_by_username(request.username)
-    if not teacher or not verify_password(request.password, teacher["password_hash"]):
-        _record_login_failure("teacher", request.username)
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+@router.get("/api/users/me/profile")
+async def get_my_profile(user: dict = Depends(get_current_user)):
+    """个人成长档案：账号信息、军衔、护盾数及最近 20 条战报"""
+    profile = get_user_profile(_current_user_id(user))
+    if not profile:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return profile
 
-    # 登录成功：清零失败计数
-    _clear_login_failures("teacher", request.username)
 
-    # P0-4：历史 SHA256 哈希校验通过后，立即原地升级为 bcrypt
-    if not is_bcrypt_hash(teacher["password_hash"]):
-        upgrade_password_hash("teacher", teacher["id"], hash_password(request.password))
-
-    token = create_jwt_token(teacher["id"], "teacher", request.username)
+@router.delete("/api/users/me/data")
+async def delete_my_data(user: dict = Depends(get_current_user)):
+    """一键清空个人行为记录、战报与活跃房间缓存（账号本身保留）"""
+    user_id = _current_user_id(user)
+    deleted = delete_user_learning_data(user_id)
+    room_cleared = clear_user_room_cache(user_id)
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": request.username,
-        "role": "teacher"
+        "message": "个人数据已清空",
+        "behavior_records_deleted": deleted["behavior_records_deleted"],
+        "study_sessions_deleted": deleted["study_sessions_deleted"],
+        "room_cache_cleared": room_cleared,
     }
-
-# --- 获取当前用户信息 ---
-@router.get("/api/me")
-async def get_me(user: dict = Depends(get_current_user)):
-    role = user.get("role")
-    if role == "student":
-        student = get_student_by_username(user["sub"])
-        if not student:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        return {"username": student["username"], "name": student["name"], "role": "student", "student_id": student["id"]}
-    elif role == "teacher":
-        teacher = get_teacher_by_username(user["sub"])
-        if not teacher:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        return {"username": teacher["username"], "role": "teacher"}

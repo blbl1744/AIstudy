@@ -35,9 +35,6 @@ from .model_loader import (
     load_trained_model,
     predict_focus,
 )
-from .state import student_notifications
-
-
 # ========== MediaPipe 初始化 ==========
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
@@ -259,18 +256,8 @@ class MediaPipePoseAnalyzer:
                 if self.consecutive_low_focus >= POSE_THRESHOLDS.get("consecutive_low_focus", 3):
                     self.total_distractions += 1
                     self.consecutive_low_focus = 0
-                    # 自动发送语音提醒到学生端
-                    try:
-                        reminder_msg = self._generate_suggestion(focus_score, head_pose_status, fatigue_status, scene)
-                        # P2-3：TTLCache 内部带锁且带容量上限，工作线程写入安全
-                        student_notifications.set(student_id, {
-                            "student_id": student_id,
-                            "message": reminder_msg,
-                            "timestamp": time.time(),
-                            "type": "voice"
-                        })
-                    except Exception:
-                        logger.exception("发送提醒失败（student_id=%s）", student_id)
+                    # M1-B：旧学生端通知缓存已移除。连续走神预警统一由房间网关
+                    # 依据房间级 distracted_streak_sec 广播 sentinel_alert，此处仅保留统计。
             else:
                 self.consecutive_low_focus = max(0, self.consecutive_low_focus - 1)
 

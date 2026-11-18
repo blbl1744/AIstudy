@@ -1,10 +1,15 @@
 """
-运行时状态层：全局缓存、推理线程池、背压标记与时间格式工具。
+运行时状态层：进程内房间缓存、连接映射、推理线程池、背压标记与时间格式工具。
 
 设计约束：
 1. 本模块只依赖 config，不依赖数据库/路由，供 db、analyzer、routers、main 共同引用，
    保证全局状态只有一份真源（不会因为拆分出现各自一份缓存）；
-2. TTLCache 内部自带锁，可同时被事件循环线程与推理工作线程访问。
+2. TTLCache 内部自带锁，可同时被事件循环线程与推理工作线程访问；
+3. main 生命周期钩子统一调度后台清理任务，避免多处启动 janitor；
+4. M1-B：清理旧师生缓存，统一为 active_rooms（房间字典）+ room_connections（连接映射），
+   房间 ttl=7200 秒，连接映射配线程锁并在 janitor 中回收失效连接。
+
+注意：本模块只保存「进程内的临时状态」，数据库 CRUD 全部下沉到 db.py。
 """
 import asyncio
 import threading
@@ -14,162 +19,169 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .config import logger
 
-# 导致其他学生的 REST 请求（列表/记录/提醒）排队超时。这里用固定 4 个工作线程的池承接推理，
-# 线程名统一加 "infer" 前缀便于日志排查；进程退出时在 lifespan 中 shutdown。
+# 全局共享推理线程池：analyzer 的视觉推理统一投递至此，避免每条 WS 各自建池
 _INFER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="infer")
 
-# ========== P2-2：单学生背压集合 ==========
-# 记录「当前已有帧正在推理中」的学生 id：同一学生上一帧未算完时，新帧直接丢弃，
-# 避免弱网/低配机器上帧缓冲无限积压导致的雪崩。
-# 该集合只在事件循环线程内增删（工作线程不触碰），因此无需额外加锁。
+# 推理背压标记：记录当前有帧在推理中的学习者 user_id（房间制下即 host_id），
+# 只在事件循环线程内增删，故用普通 set 即可。
 _inflight_students: set = set()
 
 
-# ========== P2-3：带 TTL 与容量上限的线程安全内存缓存 ==========
 class TTLCache:
-    """轻量 TTL + LRU 容量上限缓存（防止长期运行的全局字典无限膨胀导致 OOM）
+    """带容量上限与过期时间的轻量缓存，接口对齐 cachetools.TTLCache 常用方法。
 
-    设计要点：
-    - 用 OrderedDict 维护插入顺序，配合 move_to_end 实现 LRU 淘汰；
-    - 全部读写都在 RLock 保护下进行，可被事件循环线程与推理工作线程同时访问；
-    - get / items / __contains__ / __len__ 均会顺带判断过期（懒惰淘汰），
-      另有 cleanup() 供后台任务批量回收，返回本次实际清除的条数；
-    - set 时若 key 已存在先移除再插入，保证 LRU 顺序与「最新一次写入」一致。
+    内部以 OrderedDict 维护插入顺序，get/set 时刷新访问时间；expire 时按 TTL 淘汰。
+    所有读写都受实例锁保护，可在事件循环线程与工作线程间安全共享。
     """
 
-    def __init__(self, maxsize=1000, ttl=60.0):
-        self.maxsize = int(maxsize)
-        self.ttl = float(ttl)
-        self._store = OrderedDict()      # key -> (expire_at_ts, value)
+    def __init__(self, maxsize: int, ttl: float):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._store = OrderedDict()
+        self._times = {}
         self._lock = threading.RLock()
 
-    # ---------- 内部工具 ----------
-    def _is_expired(self, expire_at) -> bool:
-        """按单调时钟判断是否过期（避免系统时间回拨导致条目永不过期）"""
-        return expire_at <= time.monotonic()
-
-    def _purge_locked(self) -> int:
-        """在已持锁前提下清除所有过期条目，返回清除数量"""
-        now = time.monotonic()
-        dead = [k for k, (exp, _) in self._store.items() if exp <= now]
-        for k in dead:
-            self._store.pop(k, None)
-        return len(dead)
-
-    def _evict_locked(self):
-        """超容量时按 LRU 淘汰最旧条目"""
-        while len(self._store) > self.maxsize:
-            self._store.popitem(last=False)
-
-    # ---------- 对外接口 ----------
-    def set(self, key, value):
-        """写入/覆盖一条记录，TTL 从本次写入时刻重新计时"""
-        with self._lock:
-            self._store.pop(key, None)
-            self._store[key] = (time.monotonic() + self.ttl, value)
-            self._evict_locked()
+    def _is_expired(self, key) -> bool:
+        ts = self._times.get(key)
+        return ts is None or (time.monotonic() - ts) > self.ttl
 
     def get(self, key, default=None):
-        """读取记录；不存在或已过期一律返回 default"""
         with self._lock:
-            item = self._store.get(key)
-            if item is None:
-                return default
-            expire_at, value = item
-            if self._is_expired(expire_at):
-                # 懒惰淘汰：读到过期项立即清除，保证教师端不会看到离线学生的旧画面
+            if key not in self._store or self._is_expired(key):
                 self._store.pop(key, None)
+                self._times.pop(key, None)
                 return default
+            self._times[key] = time.monotonic()
             self._store.move_to_end(key)
-            return value
+            return self._store[key]
+
+    def set(self, key, value):
+        with self._lock:
+            self._store[key] = value
+            self._times[key] = time.monotonic()
+            self._store.move_to_end(key)
+            while len(self._store) > self.maxsize:
+                old, _ = self._store.popitem(last=False)
+                self._times.pop(old, None)
 
     def pop(self, key, default=None):
-        """取出并删除（用于提醒的一次性消费）"""
         with self._lock:
-            item = self._store.pop(key, None)
-            if item is None:
-                return default
-            expire_at, value = item
-            if self._is_expired(expire_at):
-                return default
+            value = self._store.pop(key, default)
+            self._times.pop(key, None)
             return value
 
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+            self._times.clear()
+
     def cleanup(self) -> int:
-        """清除全部过期条目，返回清除数量（供后台 janitor 定时调用）"""
+        """清理全部过期条目，返回清理条数"""
+        removed = 0
+        now = time.monotonic()
         with self._lock:
-            return self._purge_locked()
+            for key in list(self._store.keys()):
+                ts = self._times.get(key)
+                if ts is None or (now - ts) > self.ttl:
+                    self._store.pop(key, None)
+                    self._times.pop(key, None)
+                    removed += 1
+        return removed
 
-    def items(self):
-        """返回未过期条目的快照列表（调试接口用，避免持锁遍历时被外部修改）"""
+    def __len__(self):
         with self._lock:
-            now = time.monotonic()
-            return [(k, v) for k, (exp, v) in self._store.items() if exp > now]
-
-    def __contains__(self, key) -> bool:
-        return self.get(key) is not None
-
-    def __len__(self) -> int:
-        with self._lock:
-            self._purge_locked()
             return len(self._store)
 
+    def __contains__(self, key):
+        with self._lock:
+            if key not in self._store or self._is_expired(key):
+                return False
+            return True
 
-# ========== P2-3：后台缓存清理协程 ==========
+    def items(self):
+        """返回未过期条目的快照，供遍历使用"""
+        with self._lock:
+            return [(k, v) for k, v in self._store.items() if not self._is_expired(k)]
+
+
+# ========== M1-B：活跃房间缓存与连接映射 ==========
+# 房间字典结构见 room_routes.create_room：room_id / host_id / mode / is_public /
+# scene_id / scene_title / goal_text / max_watchers / punishment_types / created_at /
+# strikes_left / distracted_streak_sec / last_frame_ts / last_frame_b64 /
+# score_history / watchers(dict[int,str]) 等字段。
+active_rooms = TTLCache(maxsize=200, ttl=7200)
+
+# 每个房间的实时连接：{room_id: {user_id: WebSocket}}。WebSocket 对象由事件循环线程
+# 增删，janitor 也会读取，故配线程锁；键类型用 str 注解仅为可读性，运行时存 WebSocket。
+room_connections: dict = {}
+room_connections_lock = threading.RLock()
+
+
 async def _cache_janitor():
-    """每 60 秒清理一次内存缓存中的过期条目（防 OOM），含扩展二的分心预警状态"""
+    """每 60 秒清理一次活跃房间过期条目与失效连接（防 OOM、防幽灵连接）"""
     while True:
         try:
             await asyncio.sleep(60)
-            purged_video = student_video_cache.cleanup()
-            purged_online = online_students.cleanup()
-            purged_notice = student_notifications.cleanup()
-            purged_alert = student_alert_state.cleanup()
-            if purged_video or purged_online or purged_notice or purged_alert:
+            purged_room = active_rooms.cleanup()
+            purged_conn = 0
+            now = time.monotonic()
+            with room_connections_lock:
+                for rid in list(room_connections.keys()):
+                    peers = room_connections.get(rid)
+                    # 房间已不存在或连接表为空：整体移除
+                    if rid not in active_rooms or not peers:
+                        room_connections.pop(rid, None)
+                        purged_conn += 1
+                        continue
+                    # 逐条移除过期连接（用 TTL 时间戳近似：连接对象不记录时间，这里仅清理空映射）
+            if purged_room or purged_conn:
                 logger.info(
-                    "[缓存清理] 过期回收：视频帧 %s 条 / 在线状态 %s 条 / 提醒 %s 条 / 预警状态 %s 条",
-                    purged_video, purged_online, purged_notice, purged_alert,
+                    "[缓存清理] 过期回收：活跃房间 %s 条 / 失效连接房间 %s 个",
+                    purged_room, purged_conn,
                 )
         except asyncio.CancelledError:
-            # 生命周期结束时被 cancel，正常退出
             raise
         except Exception:
-            # 清理任务本身异常不能拖垮主服务
             logger.exception("[缓存清理] 后台清理任务执行异常")
 
-# ========== 时间格式工具（P1-7） ==========
+
 def to_iso_utc(v):
-    """将 SQLite 存储的 UTC 时间字符串转为带 Z 后缀的 ISO-8601 格式"""
-    if not v:
+    """把 datetime / 时间戳 / ISO 字符串统一转成带 Z 的 UTC ISO-8601 字符串"""
+    from datetime import datetime, timezone
+    if v is None:
         return None
-    s = str(v).replace(" ", "T")
-    return s if s.endswith("Z") or "+" in s else s + "Z"
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, (int, float)):
+        dt = datetime.fromtimestamp(v, tz=timezone.utc)
+    elif isinstance(v, str):
+        try:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return v
+    else:
+        return str(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-# ========== 学生实时视频帧缓存（P2-3：TTL + 容量上限，防 OOM）==========
-# 视频帧：10 秒无更新即视为离线自动过期；容量上限 200，超出按 LRU 淘汰
-student_video_cache = TTLCache(maxsize=200, ttl=10)
-# 语音提醒：学生端一次性消费，5 分钟未取自动过期，避免堆积
-student_notifications = TTLCache(maxsize=1000, ttl=300)
-# 在线学生状态：60 秒无心跳视为离线
-online_students = TTLCache(maxsize=500, ttl=60)
-# 扩展二：持续分心自动预警状态（连续分心时长 / 上次提醒时间 / 是否预警中 / 预警原因）
-# 5 分钟无更新自动回收，容量上限 500，避免学生长期离线后状态无限堆积
-student_alert_state = TTLCache(maxsize=500, ttl=300)
 
-def update_student_video_cache(student_id: int, annotated_image: str, focus_score: int,
-                                 action_label="unknown", head_pose="", eye_focus="", fatigue_level="",
-                                 name=""):
-    """更新学生视频帧缓存（TTLCache 内部加锁，可被推理工作线程安全调用）"""
-    student_video_cache.set(student_id, {
-        "image": annotated_image,
-        "timestamp": time.time(),
-        "focus_score": focus_score,
-        "action_label": action_label,
-        "head_pose": head_pose,
-        "eye_focus": eye_focus,
-        "fatigue_level": fatigue_level,
-        "name": name
-    })
-
-def get_student_video_cache(student_id: int):
-    """获取学生视频帧缓存（过期或不存在返回 None）"""
-    return student_video_cache.get(student_id)
+def clear_user_room_cache(user_id: int) -> int:
+    """按用户 ID 清除其创建的或作为督学官参与的活跃房间及其连接，返回清理房间数"""
+    removed = 0
+    with active_rooms._lock:
+        for key, value in list(active_rooms._store.items()):
+            if not isinstance(value, dict):
+                continue
+            watchers = value.get("watchers") or {}
+            if value.get("host_id") == user_id or user_id in watchers:
+                active_rooms._store.pop(key, None)
+                active_rooms._times.pop(key, None)
+                removed += 1
+            with room_connections_lock:
+                peers = room_connections.get(key)
+                if peers is not None:
+                    peers.pop(user_id, None)
+                    if not peers:
+                        room_connections.pop(key, None)
+    return removed

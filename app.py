@@ -17,8 +17,7 @@ __all__ = ["app"]
 
 if __name__ == "__main__":
     logger.info("=" * 50)
-    logger.info("AI学伴 · 专注度智能监护系统")
-    logger.info("访问地址: http://%s:%s", HOST, PORT)
-    logger.info("学生: 注册后登录 → 进入专注度监控")
+    logger.info("AI学伴 · 统一 API 服务（M1-A）")
+    logger.info("接口文档: http://%s:%s/docs", HOST, PORT)
     logger.info("=" * 50)
     uvicorn.run(app, host=HOST, port=PORT)

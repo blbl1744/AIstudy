@@ -56,8 +56,8 @@ main ──► routers ──► analyzer ──► model_loader ──► state
 | 环境变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `AI_STUDY_JWT_SECRET` | 生产必填 | 自动生成随机值并告警 | JWT 签名密钥，长度须 **≥ 32 位**。未设置或过弱时启动会随机生成，重启/多副本间不一致将导致令牌全部失效，生产必须显式固定 |
-| `AI_STUDY_CORS_ORIGINS` | 生产必填 | `http://localhost:8001,http://127.0.0.1:8001` | CORS 白名单，英文逗号分隔。含 `*` 通配符时自动关闭凭证携带（`allow_credentials=False`）；同时用于 WebSocket `Origin` 白名单校验 |
-| `AI_STUDY_ADMIN_PASSWORD` | 否 | 空（不创建） | 初始管理员（教师端）密码；仅在数据库为空且该项非空时创建管理员账号 |
+| `AI_STUDY_CORS_ORIGINS` | 生产必填 | `http://localhost:8001,http://127.0.0.1:8001,http://localhost:5173,http://127.0.0.1:5173` | CORS 白名单，英文逗号分隔（M1-A 起默认放行 Vite 前端 5173 端口）。含 `*` 通配符时自动关闭凭证携带（`allow_credentials=False`）；同时用于 WebSocket `Origin` 白名单校验 |
+| `AI_STUDY_ADMIN_PASSWORD` | 否 | 空（不创建） | 旧教师端管理员初始密码；M1-A 起已剥离双角色，不再初始化教师管理员账号 |
 | `AI_STUDY_ENABLE_MODEL` | 否 | `0` | `1`=启用已训练模型，`0`=纯规则引擎。默认纯规则模式，无模型文件亦可运行 |
 | `AI_STUDY_MODEL_PATH` | 否 | `trained_model.pkl` | 模型文件路径（`AI_STUDY_ENABLE_MODEL=1` 时生效） |
 | `AI_STUDY_MODEL_SHA256` | 否 | 空（跳过校验） | 模型文件完整性校验和，防止加载被替换的模型文件 |
@@ -82,7 +82,7 @@ pip install -r requirements.txt
 
 # 2. 配置环境变量（最小可用集）
 set AI_STUDY_JWT_SECRET=<不少于32位的随机串>
-set AI_STUDY_CORS_ORIGINS=http://localhost:8001,http://127.0.0.1:8001
+set AI_STUDY_CORS_ORIGINS=http://localhost:8001,http://127.0.0.1:8001,http://localhost:5173,http://127.0.0.1:5173
 
 # 3. 启动（三种方式等价，任选其一）
 uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
@@ -93,7 +93,7 @@ python -m app.main
 curl http://127.0.0.1:8001/healthz
 ```
 
-教师端页面：`http://127.0.0.1:8001/`　学生端页面：`http://127.0.0.1:8001/student`
+M1-A 起后端仅提供 API（健康检查：`http://127.0.0.1:8001/healthz`）；前端独立运行于 Vite 开发服务 `http://localhost:5173`。
 
 ---
 

@@ -242,7 +242,9 @@ _ENV_CORS_ORIGINS = (os.getenv("AI_STUDY_CORS_ORIGINS") or "").strip()
 if _ENV_CORS_ORIGINS:
     CORS_ALLOW_ORIGINS = [o.strip() for o in _ENV_CORS_ORIGINS.split(",") if o.strip()]
 else:
-    CORS_ALLOW_ORIGINS = [f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"]
+    # M1-A：前端 Vite 开发服务器（5173）默认放行，仍可由环境变量整体覆盖
+    CORS_ALLOW_ORIGINS = [f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}",
+                          "http://localhost:5173", "http://127.0.0.1:5173"]
 
 # 通配来源与凭证模式互斥：来源中出现 "*" 时强制关闭凭证，防止任意站点越权读取 Cookie / Authorization
 CORS_ALLOW_CREDENTIALS = "*" not in CORS_ALLOW_ORIGINS

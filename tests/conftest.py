@@ -1,5 +1,5 @@
 """
-P3-3 测试夹具（conftest）
+测试夹具（conftest）
 
 职责：
 1. 在任何 app 模块被导入之前，向 sys.modules 注入 cv2 / mediapipe 轻量桩模块，
@@ -7,7 +7,7 @@ P3-3 测试夹具（conftest）
 2. 在导入 app 之前写死测试专用环境变量（JWT 密钥、CORS 白名单、数据库路径等），
    保证配置层读取到的是测试值而非生产默认值；
 3. 提供 client 夹具：按用例动态隔离 SQLite 数据库、触发完整 lifespan，
-   并在用例前后清理登录限速状态与三类内存缓存，避免用例互相污染；
+   并在用例前后清理登录限速状态与活跃房间/连接映射，避免用例互相污染；
 4. 提供 fake_landmarks 夹具：生成符合 MediaPipe 33 点结构的模拟关键点。
 
 说明：本文件只做测试环境搭建，不修改任何业务代码。
@@ -90,7 +90,7 @@ def _build_mediapipe_stub() -> types.ModuleType:
     Pose.process / FaceMesh.process 恒定返回「未检测到关键点」的结果对象，
     使推理链路在无视觉库环境下仍可完整走通到兜底分支。
     """
-    class Pose:  # noqa: D401 - 桩类，仅需可实例化
+    class Pose:
         def __init__(self, **_kwargs):
             pass
 
@@ -164,8 +164,6 @@ _install_visual_stubs()
 
 
 # ========== 2. 测试环境变量（必须在 import app 之前生效） ==========
-# 引导库路径：使用进程级临时目录，保证「导入期」就有可用的数据库位置；
-# 每个用例仍会通过 client 夹具把 db.DB_FILE 指向各自 tmp_path，实现用例级隔离。
 _BOOTSTRAP_DIR = Path(tempfile.mkdtemp(prefix="aistudy_pytest_bootstrap_"))
 
 os.environ["AI_STUDY_DB"] = str(_BOOTSTRAP_DIR / "bootstrap.db")
@@ -177,15 +175,14 @@ os.environ["AI_STUDY_CORS_ORIGINS"] = "http://localhost:8001,http://127.0.0.1:80
 os.environ["AI_STUDY_ENABLE_MODEL"] = "0"
 # 降级日志级别，避免测试输出被 INFO 日志淹没
 os.environ["AI_STUDY_LOG_LEVEL"] = "WARNING"
-# 默认关闭调试接口（与生产默认一致），用于验证「默认调试接口不可达」
+# 默认关闭调试接口（与生产默认一致）
 os.environ.pop("AI_STUDY_DEBUG_API", None)
-# 不注入管理员账号，教师账号由用例自行注册
 os.environ.pop("AI_STUDY_ADMIN_PASSWORD", None)
 
 
 # ========== 3. 运行时状态清理工具 ==========
 def _reset_runtime_state() -> None:
-    """清理登录限速记录、四类内存缓存、在途推理标记与评分历史"""
+    """清理登录限速记录、活跃房间与连接映射、在途推理标记与评分历史"""
     from app import auth as auth_module
     from app import state as state_module
     from app.analyzer import analyzer
@@ -193,16 +190,10 @@ def _reset_runtime_state() -> None:
     with auth_module._login_fail_lock:
         auth_module._login_fail.clear()
 
-    for cache in (
-        state_module.student_video_cache,
-        state_module.online_students,
-        state_module.student_notifications,
-        # 扩展二：持续分心预警状态也必须逐用例清空，否则上个用例的预警会飘到下个用例
-        state_module.student_alert_state,
-    ):
-        with cache._lock:
-            cache._store.clear()
-
+    # M1-B：房间与连接是进程内唯一真源，逐用例清空避免串味
+    state_module.active_rooms.clear()
+    with state_module.room_connections_lock:
+        state_module.room_connections.clear()
     state_module._inflight_students.clear()
 
     for attr in ("focus_score_history", "head_tilt_history", "shoulder_history", "action_history"):
@@ -230,7 +221,6 @@ def client(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     import app.db as db_module
-    import app.routers.student_routes as student_routes_module
     import app.state as state_module
     from app.main import app as application
 
@@ -240,7 +230,6 @@ def client(tmp_path, monkeypatch):
 
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pytest-infer")
     monkeypatch.setattr(state_module, "_INFER_POOL", pool, raising=True)
-    monkeypatch.setattr(student_routes_module, "_INFER_POOL", pool, raising=True)
 
     _reset_runtime_state()
     try:
@@ -253,12 +242,7 @@ def client(tmp_path, monkeypatch):
 
 # ========== 4. 模拟关键点 ==========
 def build_landmarks(nose_y=0.35, hip_center_x=0.50):
-    """按 MediaPipe 33 点结构生成关键点列表（默认值即端正坐姿）
-
-    Args:
-        nose_y: 鼻尖纵坐标（0 在画面顶部，越大越靠下），用于模拟低头
-        hip_center_x: 髋部中心横坐标，用于模拟身体晃动
-    """
+    """按 MediaPipe 33 点结构生成关键点列表（默认值即端正坐姿）"""
     shoulder_y = 0.60
     hip_y = 0.85
     points = []
@@ -266,7 +250,6 @@ def build_landmarks(nose_y=0.35, hip_center_x=0.50):
     def _add(x, y, z=0.0):
         points.append(SimpleNamespace(x=float(x), y=float(y), z=float(z), visibility=1.0))
 
-    # 逐一下标填充：0 鼻、2/5 双眼、7/8 双耳、11/12 双肩、23/24 双髋，其余补中性坐标
     base = {
         0: (0.50, nose_y),
         1: (0.47, nose_y - 0.04),
