@@ -97,6 +97,12 @@ export const roomApi = {
     http.get<RoomMeta>(`/rooms/${encodeURIComponent(roomId)}`).then((res) => res.data),
   /** 房主实时快照地址（受鉴权保护，img 标签直接引用即可随请求带 Token 需另行处理） */
   snapshotUrl: (roomId: string): string => `/api/rooms/${roomId}/snapshot.jpg`,
+  /** 惩罚提交 HTTP 兜底：WS 未连接或未收到回执时调用，复用后端同一套校验与解锁逻辑 */
+  punishmentSubmit: (
+    roomId: string,
+    payload: { punishment_type: string; content: string },
+  ): Promise<{ passed: boolean; reason: string; strikes_left: number }> =>
+    http.post(`/rooms/${encodeURIComponent(roomId)}/punishment/submit`, payload).then((res) => res.data),
 }
 
 /** 运行配置接口：供前端判断是否处于大模型离线剧本模式 */

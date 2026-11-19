@@ -62,10 +62,10 @@ type AudioCtxCtor = typeof AudioContext
 const audioWindow = window as unknown as { webkitAudioContext?: AudioCtxCtor }
 const AudioCtx: AudioCtxCtor | undefined = window.AudioContext ?? audioWindow.webkitAudioContext
 let audioCtx: AudioContext | null = null
-const soundEnabled = ref(true)
 
 function getCtx(): AudioContext | null {
-  if (!AudioCtx || !soundEnabled.value) return null
+  // 互动音效开关由左下控制条统一控制，与 store 共享状态
+  if (!AudioCtx || !room.interactionSoundOn) return null
   if (!audioCtx) audioCtx = new AudioCtx()
   if (audioCtx.state === 'suspended') void audioCtx.resume()
   return audioCtx
@@ -182,43 +182,38 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="hud" :class="{ 'hud--shake': shaking }">
-    <!-- 左上：三次机会生命值 + 扣血震动 -->
-    <div class="hud-block hud-lives">
-      <span class="hud-label">生命值</span>
-      <span
-        v-for="(alive, i) in hearts"
-        :key="i"
-        class="hud-heart"
-        :class="{ 'hud-heart--lost': !alive }"
-      >{{ alive ? '◆' : '◇' }}</span>
-    </div>
+    <!-- 顶部信息条：生命值 / 专注评分 / 计时 / 在线督学 / 走神预警，
+         采用不重叠的流式栅格排布，不再用居中绝对定位覆盖房间信息框 -->
+    <div class="hud-topbar">
+      <div class="hud-block hud-lives">
+        <span class="hud-label">生命值</span>
+        <span
+          v-for="(alive, i) in hearts"
+          :key="i"
+          class="hud-heart"
+          :class="{ 'hud-heart--lost': !alive }"
+        >{{ alive ? '◆' : '◇' }}</span>
+      </div>
 
-    <!-- 右上：在线督学官角标 -->
-    <div class="hud-block hud-watchers">
-      在线督学 <b>{{ room.watcherCount }}</b>
-    </div>
+      <div class="hud-block hud-center">
+        <span class="hud-label">专注</span>
+        <b class="hud-score">{{ scoreText }}</b>
+        <span class="hud-sep"></span>
+        <span class="hud-label">计时</span>
+        <span class="hud-timer">{{ clockText }}</span>
+      </div>
 
-    <!-- 顶部中央：专注评分与计时 -->
-    <div class="hud-center">
-      <div class="hud-score">专注 <b>{{ scoreText }}</b></div>
-      <div class="hud-timer">{{ clockText }}</div>
-    </div>
+      <div class="hud-block hud-distract">
+        <span class="hud-label">走神预警</span>
+        <div class="hud-bar">
+          <div class="hud-bar__fill" :style="{ width: distractedPercent + '%' }"></div>
+        </div>
+      </div>
 
-    <!-- 走神进度条 -->
-    <div class="hud-distract">
-      <span class="hud-label">走神预警</span>
-      <div class="hud-bar">
-        <div class="hud-bar__fill" :style="{ width: distractedPercent + '%' }"></div>
+      <div class="hud-block hud-watchers">
+        在线督学 <b>{{ room.watcherCount }}</b>
       </div>
     </div>
-
-    <!-- 音效开关 -->
-    <button
-      type="button"
-      class="hud-sound-toggle"
-      :class="{ 'hud-sound-toggle--on': soundEnabled }"
-      @click="soundEnabled = !soundEnabled"
-    >音效 {{ soundEnabled ? '开' : '关' }}</button>
 
     <!-- 横向飘过弹幕层：纯文本插值 -->
     <div class="hud-barrage-layer">
@@ -248,25 +243,36 @@ onBeforeUnmount(() => {
 }
 
 .hud-block {
-  position: absolute;
-  top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 12px;
   background: rgba(0, 0, 0, 0.45);
   border: 1px solid var(--scene-primary, #00e5ff);
   border-radius: 3px;
   font-size: 13px;
+  white-space: nowrap;
 }
-.hud-lives { left: 14px; }
-.hud-watchers { right: 14px; }
+
+/* 顶部信息条：流式 flex 排布，各块独立占位、自动换行，互不覆盖房间信息框 */
+.hud-topbar {
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  pointer-events: none;
+}
 .hud-label {
   opacity: 0.7;
-  margin-right: 8px;
   font-size: 12px;
 }
 .hud-heart {
   font-size: 18px;
   color: var(--scene-alert, #ff2a55);
-  margin-right: 4px;
   text-shadow: 0 0 8px var(--scene-alert, #ff2a55);
 }
 .hud-heart--lost {
@@ -274,32 +280,27 @@ onBeforeUnmount(() => {
   text-shadow: none;
 }
 
-.hud-center {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  text-align: center;
-  text-shadow: 0 0 10px var(--scene-primary, #00e5ff);
+.hud-score {
+  font-size: 18px;
+  color: #fff;
 }
-.hud-score { font-size: 14px; }
-.hud-score b { font-size: 20px; }
+.hud-sep {
+  width: 1px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.3);
+  margin: 0 2px;
+}
 .hud-timer {
-  font-size: 26px;
+  font-size: 20px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 2px;
 }
 
 .hud-distract {
-  position: absolute;
-  top: 70px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 220px;
-  text-align: center;
+  min-width: 200px;
 }
 .hud-bar {
-  margin-top: 4px;
+  flex: 1 1 120px;
   height: 6px;
   background: rgba(255, 255, 255, 0.15);
   border-radius: 3px;
@@ -309,23 +310,6 @@ onBeforeUnmount(() => {
   height: 100%;
   background: var(--scene-alert, #ff2a55);
   transition: width 0.25s linear;
-}
-
-.hud-sound-toggle {
-  position: absolute;
-  right: 14px;
-  bottom: 14px;
-  pointer-events: auto;
-  padding: 4px 10px;
-  font-size: 12px;
-  color: var(--scene-primary, #00e5ff);
-  background: rgba(0, 0, 0, 0.5);
-  border: 1px solid var(--scene-primary, #00e5ff);
-  border-radius: 3px;
-  cursor: pointer;
-}
-.hud-sound-toggle--on {
-  background: color-mix(in srgb, var(--scene-primary, #00e5ff) 20%, transparent);
 }
 
 .hud-barrage-layer {

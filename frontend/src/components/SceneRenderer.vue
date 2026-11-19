@@ -4,6 +4,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { ISourceOptions } from '@tsparticles/engine'
 import type { SceneConfig } from '../types'
+import { useRoomStore } from '../stores/room'
+
+// 互动音效开关与其他房间态共享 store，供左下控制条直接切换（不再用右下悬浮按钮）
+const room = useRoomStore()
 
 const props = defineProps<{
   scene: SceneConfig
@@ -370,6 +374,14 @@ onBeforeUnmount(() => {
         @click="soundOn = !soundOn"
       >
         {{ soundOn ? '环境音 开' : '环境音 关' }}
+      </button>
+      <button
+        type="button"
+        class="scene-btn"
+        :class="{ 'scene-btn--active': room.interactionSoundOn }"
+        @click="room.interactionSoundOn = !room.interactionSoundOn"
+      >
+        音效 {{ room.interactionSoundOn ? '开' : '关' }}
       </button>
       <label class="scene-volume">
         <span>音量</span>

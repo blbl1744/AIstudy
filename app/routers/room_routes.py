@@ -31,7 +31,11 @@ from ..analyzer import analyzer
 from ..auth import get_current_user, verify_jwt_token
 from ..config import CORS_ALLOW_ORIGINS, logger
 from ..db import calc_rank_title, get_db, save_behavior_record
-from ..punishment import evaluate_strike, verify_punishment_submission
+from ..punishment import (
+    evaluate_strike,
+    verify_punishment_submission,
+    verify_punishment_with_llm,
+)
 from ..scene_generator import compile_scene, list_presets
 
 router = APIRouter()
@@ -95,6 +99,12 @@ class CreateRoomRequest(BaseModel):
         if any(ch in text for ch in "<>&\"'"):
             raise ValueError("场景标题包含非法字符")
         return text
+
+
+class PunishmentSubmitRequest(BaseModel):
+    """惩罚提交 HTTP 兜底请求：字段与 WS punishment_submit 严格对齐"""
+    punishment_type: str = ""
+    content: str = ""
 
 
 def _current_user_id(user: dict) -> int:
@@ -242,6 +252,38 @@ async def room_meta(room_id: str, user: dict = Depends(get_current_user)):
     }
 
 
+@router.post("/api/rooms/{room_id}/punishment/submit")
+async def punishment_submit_http(
+    room_id: str, request: PunishmentSubmitRequest,
+    user: dict = Depends(get_current_user),
+):
+    """WS 未连接时的惩罚提交兜底：复用统一校验与解锁逻辑，同步房间状态并全房推 punishment_cleared。
+
+    通过/拒绝均以 200 回执结构化结果，绝不因语义服务不可用挂起请求。
+    """
+    user_id = _current_user_id(user)
+    room = state.active_rooms.get(room_id)
+    if not isinstance(room, dict):
+        raise HTTPException(status_code=404, detail="房间不存在")
+    if user_id != room.get("host_id"):
+        raise HTTPException(status_code=403, detail="仅房主可提交惩罚解锁")
+    verdict = await _run_punishment_verdict(
+        room, request.punishment_type, request.content,
+        str(room.get("goal_text", "") or ""),
+    )
+    if verdict["passed"]:
+        await _broadcast(room_id, {
+            "type": "punishment_cleared",
+            "shield_saved": False,
+            "strikes_left": room.get("strikes_left", 3),
+        })
+    return {
+        "passed": bool(verdict["passed"]),
+        "reason": verdict.get("reason", ""),
+        "strikes_left": room.get("strikes_left", 3),
+    }
+
+
 # ========== 广播工具 ==========
 async def _broadcast(room_id: str, payload: dict, exclude_user_id: int | None = None) -> None:
     """向房间内全部连接广播消息（可选排除某用户）"""
@@ -276,6 +318,22 @@ async def _notify_watcher_update(room_id: str, room: dict) -> None:
         "watcher_count": len(watchers),
         "watchers": [{"user_id": uid, "nickname": name} for uid, name in watchers.items()],
     })
+
+
+async def _run_punishment_verdict(room: dict, punishment_type: str, content, goal_text: str) -> dict:
+    """惩罚提交统一入口：复用带 8 秒超时降级的校验解锁函数，异常也必有回执。"""
+    try:
+        return await verify_punishment_with_llm(
+            punishment_type, content, goal_text, room=room, timeout=8.0,
+        )
+    except Exception:
+        logger.exception("惩罚校验解锁内部异常，按未通过回执处理")
+        return {
+            "passed": False,
+            "reason": "服务处理异常，请重新提交",
+            "punishment_type": punishment_type,
+            "unlocked": False,
+        }
 
 
 async def _broadcast_dialogue(room_id: str, room: dict, trigger: str,
@@ -501,108 +559,121 @@ async def room_ws(websocket: WebSocket, room_id: str):
             if not isinstance(msg, dict):
                 continue
             mtype = msg.get("type")
+            try:
+                if is_host:
+                    # ===== 学习者消息 =====
+                    if mtype == "frame":
+                        image = msg.get("image")
+                        if image:
+                            # 快照画面即时保存：锁房态也更新，保证监督端画面不中断
+                            room["last_frame_b64"] = image
+                        # 锁房态：仍更新画面，但跳过常规推理，仅下发解锁提示（惩罚提交走独立分支）
+                        if room.get("is_locked"):
+                            await websocket.send_json({"type": "room_locked", "msg": "请先完成惩罚解锁"})
+                            continue
+                        if not image:
+                            continue
+                        # 背压：同一学习者上一帧未算完则丢弃
+                        if user_id in state._inflight_students:
+                            await websocket.send_json({"type": "analysis_update", "skipped": True})
+                            continue
+                        state._inflight_students.add(user_id)
+                        scene = msg.get("scene", "selfstudy")
 
-            if is_host:
-                # ===== 学习者消息 =====
-                if mtype == "frame":
-                    # 锁房态：忽略常规推理，仅下发解锁提示（惩罚提交走独立分支）
-                    if room.get("is_locked"):
-                        await websocket.send_json({"type": "room_locked", "msg": "请先完成惩罚解锁"})
-                        continue
-                    image = msg.get("image")
-                    if not image:
-                        continue
-                    # 快照画面即时保存（推理未完成也可供鉴权快照读取）
-                    room["last_frame_b64"] = image
-                    # 背压：同一学习者上一帧未算完则丢弃
-                    if user_id in state._inflight_students:
-                        await websocket.send_json({"type": "analysis_update", "skipped": True})
-                        continue
-                    state._inflight_students.add(user_id)
-                    scene = msg.get("scene", "selfstudy")
+                        def _done(fut, rid=room_id, uid=user_id, frame=image, app_loop=loop):
+                            """推理线程回调：把回写逻辑调度回事件循环执行（默认参数锁定当帧变量）"""
+                            try:
+                                result = fut.result()
+                            except Exception:
+                                logger.exception("房间帧推理异常（room_id=%s）", rid)
+                                result = None
+                            asyncio.run_coroutine_threadsafe(_on_frame_done(rid, uid, frame, result), app_loop)
 
-                    def _done(fut, rid=room_id, uid=user_id, frame=image, app_loop=loop):
-                        """推理线程回调：把回写逻辑调度回事件循环执行（默认参数锁定当帧变量）"""
+                        future = state._INFER_POOL.submit(analyzer.analyze, image, scene=scene, student_id=user_id)
+                        future.add_done_callback(_done)
+
+                    elif mtype == "user_message":
+                        # 学习者求助/互动：1~200 字校验 + 控制字符清洗，触发 chat 流式回复
+                        raw = msg.get("text", "")
+                        text = "".join(ch for ch in str(raw) if ch == "\n" or (ord(ch) >= 32 and ord(ch) != 127))
+                        text = text.strip()
+                        if 1 <= len(text) <= 200:
+                            await _broadcast_dialogue(room_id, room, "chat", user_input=text)
+
+                    elif mtype == "punishment_submit":
+                        # 惩罚提交：统一校验 + 8 秒超时降级；通过/拒绝/异常均有回执，绝不卡住前端
                         try:
-                            result = fut.result()
+                            verdict = await _run_punishment_verdict(
+                                room,
+                                str(msg.get("punishment_type", "") or ""),
+                                msg.get("content", ""),
+                                str(room.get("goal_text", "") or ""),
+                            )
+                            if verdict["passed"]:
+                                await _broadcast(room_id, {
+                                    "type": "punishment_cleared",
+                                    "shield_saved": False,
+                                    "strikes_left": room.get("strikes_left", 3),
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "punishment_rejected",
+                                    "reason": verdict.get("reason", "校验未通过"),
+                                })
                         except Exception:
-                            logger.exception("房间帧推理异常（room_id=%s）", rid)
-                            result = None
-                        asyncio.run_coroutine_threadsafe(_on_frame_done(rid, uid, frame, result), app_loop)
+                            logger.exception("处理惩罚提交异常（room_id=%s）", room_id)
+                            await websocket.send_json({
+                                "type": "punishment_rejected",
+                                "reason": "服务处理异常，请重新提交",
+                            })
 
-                    future = state._INFER_POOL.submit(analyzer.analyze, image, scene=scene, student_id=user_id)
-                    future.add_done_callback(_done)
-
-                elif mtype == "user_message":
-                    # 学习者求助/互动：1~200 字校验 + 控制字符清洗，触发 chat 流式回复
-                    raw = msg.get("text", "")
-                    text = "".join(ch for ch in str(raw) if ch == "\n" or (ord(ch) >= 32 and ord(ch) != 127))
-                    text = text.strip()
-                    if 1 <= len(text) <= 200:
-                        await _broadcast_dialogue(room_id, room, "chat", user_input=text)
-
-                elif mtype == "punishment_submit":
-                    # 惩罚提交：规则校验通过即解锁并广播，未通过仅向提交者回 reason
-                    verdict = verify_punishment_submission(
-                        str(msg.get("punishment_type", "") or ""),
-                        msg.get("content", ""),
-                        str(room.get("goal_text", "") or ""),
-                        room=room,
-                    )
-                    if verdict["passed"]:
+                    elif mtype == "finish_session":
+                        now = _now_ts()
+                        created = float(room.get("created_at") or now)
+                        duration_minutes = int(max(0.0, now - created) // 60)
+                        scores = [s for s in (room.get("score_history") or [])
+                                  if isinstance(s, (int, float)) and not isinstance(s, bool)]
+                        avg_score = round(sum(scores) / len(scores)) if scores else None
+                        # 如实取引擎与联动累加的真实扣血次数（护盾抵消也计一次），不用 strikes_left 反推
+                        strikes_used = int(room.get("strikes_used", 0) or 0)
+                        settled = _settle_session(room, user_id, duration_minutes, avg_score, strikes_used)
                         await _broadcast(room_id, {
-                            "type": "punishment_cleared",
-                            "shield_saved": False,
-                            "strikes_left": room.get("strikes_left", 3),
+                            "type": "session_finished",
+                            "duration_minutes": duration_minutes,
+                            "avg_score": avg_score,
+                            **settled,
                         })
-                    else:
-                        await websocket.send_json({
-                            "type": "punishment_rejected",
-                            "reason": verdict.get("reason", "校验未通过"),
-                        })
+                        # 结算后清理房间与全部连接
+                        state.active_rooms.pop(room_id, None)
+                        with state.room_connections_lock:
+                            state.room_connections.pop(room_id, None)
+                        state._inflight_students.discard(user_id)
+                        break
 
-                elif mtype == "finish_session":
-                    now = _now_ts()
-                    created = float(room.get("created_at") or now)
-                    duration_minutes = int(max(0.0, now - created) // 60)
-                    scores = [s for s in (room.get("score_history") or [])
-                              if isinstance(s, (int, float)) and not isinstance(s, bool)]
-                    avg_score = round(sum(scores) / len(scores)) if scores else None
-                    # 如实取引擎与联动累加的真实扣血次数（护盾抵消也计一次），不用 strikes_left 反推
-                    strikes_used = int(room.get("strikes_used", 0) or 0)
-                    settled = _settle_session(room, user_id, duration_minutes, avg_score, strikes_used)
-                    await _broadcast(room_id, {
-                        "type": "session_finished",
-                        "duration_minutes": duration_minutes,
-                        "avg_score": avg_score,
-                        **settled,
-                    })
-                    # 结算后清理房间与全部连接
-                    state.active_rooms.pop(room_id, None)
-                    with state.room_connections_lock:
-                        state.room_connections.pop(room_id, None)
-                    state._inflight_students.discard(user_id)
-                    break
-
-                elif mtype == "leave_room":
-                    # 房主暂时离席：跳出循环，由 finally 标记离线并广播 host_status（房间保留）
-                    break
-            else:
-                # ===== 督学官消息 =====
-                if mtype == "barrage":
-                    text = str(msg.get("text", "")).strip()
-                    if 1 <= len(text) <= 60:
-                        await _broadcast(room_id, {
-                            "type": "room_interaction", "kind": "barrage",
-                            "from": nickname, "text": text,
-                        })
-                elif mtype == "sound_effect":
-                    sound = msg.get("sound")
-                    if sound in SOUND_WHITELIST:
-                        await _broadcast(room_id, {
-                            "type": "room_interaction", "kind": "sound_effect",
-                            "from": nickname, "sound": sound,
-                        })
+                    elif mtype == "leave_room":
+                        # 房主暂时离席：跳出循环，由 finally 标记离线并广播 host_status（房间保留）
+                        break
+                else:
+                    # ===== 督学官消息 =====
+                    if mtype == "barrage":
+                        text = str(msg.get("text", "")).strip()
+                        if 1 <= len(text) <= 60:
+                            await _broadcast(room_id, {
+                                "type": "room_interaction", "kind": "barrage",
+                                "from": nickname, "text": text,
+                            })
+                    elif mtype == "sound_effect":
+                        sound = msg.get("sound")
+                        if sound in SOUND_WHITELIST:
+                            await _broadcast(room_id, {
+                                "type": "room_interaction", "kind": "sound_effect",
+                                "from": nickname, "sound": sound,
+                            })
+            except Exception as exc:
+                logger.exception(
+                    "房间 %s 单条消息处理异常，已隔离避免断连（用户 %s）：%s",
+                    room_id, user_id, exc,
+                )
     finally:
         # 断开收尾：区分「结算销毁」与「暂离保留」两条路径
         if is_host:

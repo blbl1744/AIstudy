@@ -735,3 +735,83 @@ def test_stats_session_detail_and_csv_export(client):
     # 越权隔离：他人导出的 CSV 不含本用户战报
     other_text = client.get("/api/stats/export.csv", headers=intruder["headers"]).content.decode("utf-8-sig")
     assert "流浪地球" not in other_text
+
+
+# ========== 12. 联调回归：锁房推流仍更新画面 + 惩罚双通道回执 ==========
+def test_locked_frame_and_punishment_receipts(client, monkeypatch):
+    """锁房推流持续更新画面缓存；惩罚通过/拒绝均有回执且 HTTP 兜底可解锁"""
+    import app.punishment as pun
+    import app.routers.room_routes as room_module
+
+    host = _register_and_login(client, "joint_host", "学习者")
+
+    # 测试环境无 Key：语义复核直接放行，走纯规则分支，避免真实 LLM 调用
+    monkeypatch.setattr(pun, "LLM_API_KEY", "")
+    # 屏蔽开局流式对话，减少 WS 噪音，便于精确断言回执
+    async def _noop_dialogue(*args, **kwargs):
+        return
+    monkeypatch.setattr(room_module, "_broadcast_dialogue", _noop_dialogue)
+
+    room = _create_room(client, host["headers"])
+    rid = room["room_id"]
+
+    with client.websocket_connect(
+        "/ws/room/%s?token=%s" % (rid, host["token"]), headers={"origin": VALID_ORIGIN}
+    ) as host_ws:
+        host_ws.receive_json()  # watcher_update(count=0)
+
+        # --- A. 锁房期间推流仍更新 last_frame_b64，仅跳过扣血推理 ---
+        live = state_module.active_rooms.get(rid)
+        live["is_locked"] = True
+        live["punishment_type"] = "feynman_recall"
+        live["strikes_left"] = 0
+        frame_b64 = base64.b64encode(b"locked-frame-jpeg").decode("utf-8")
+        host_ws.send_json({"type": "frame", "image": frame_b64, "scene": "selfstudy"})
+        locked = _recv_type(host_ws, "room_locked")
+        assert "解锁" in locked.get("msg", ""), "锁房推流须下发解锁提示"
+        assert live["last_frame_b64"] == frame_b64, "锁房态推流仍须更新画面缓存"
+        snap = client.get("/api/rooms/%s/snapshot.jpg" % rid, headers=host["headers"])
+        assert snap.status_code == 200 and snap.content == b"locked-frame-jpeg", \
+            "监督端应能读到锁房期间的最新画面"
+
+        # --- B. 拒绝回执：敷衍内容须回 punishment_rejected(reason) 且不解锁 ---
+        host_ws.send_json({
+            "type": "punishment_submit", "punishment_type": "feynman_recall",
+            "content": "哈哈哈哈哈哈",
+        })
+        rejected = _recv_type(host_ws, "punishment_rejected")
+        assert rejected.get("reason"), "拒绝回执须带具体原因"
+        assert state_module.active_rooms.get(rid)["is_locked"] is True, "拒绝不得解锁"
+
+        # --- C. 通过回执：有效费曼输出须回 punishment_cleared 并解锁 ---
+        host_ws.send_json({
+            "type": "punishment_submit", "punishment_type": "feynman_recall",
+            "content": "词法分析就是把源程序字符流切成记号，我用有限自动机识别标识符再输出二元式",
+        })
+        cleared = _recv_type(host_ws, "punishment_cleared")
+        assert cleared["strikes_left"] == 3, "通过回执须携带恢复后的机会数"
+        assert state_module.active_rooms.get(rid)["is_locked"] is False, "通过须解锁房间"
+
+    # --- D. HTTP 兜底解锁：WS 未连时 POST 接口复用校验并同步解锁 ---
+    live = state_module.active_rooms.get(rid)
+    live["is_locked"] = True
+    live["punishment_type"] = "feynman_recall"
+    live["strikes_left"] = 0
+    resp = client.post(
+        "/api/rooms/%s/punishment/submit" % rid,
+        json={"punishment_type": "feynman_recall",
+              "content": "词法分析就是把源程序字符流切成记号，我用有限自动机识别标识符再输出二元式"},
+        headers=host["headers"],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["passed"] is True and body["strikes_left"] == 3, "HTTP 兜底须返回通过结果"
+    assert state_module.active_rooms.get(rid)["is_locked"] is False, "HTTP 兜底须同步解锁房间"
+
+    # 非房主调用兜底接口须 403
+    other = _register_and_login(client, "joint_intruder", "越权者")
+    assert client.post(
+        "/api/rooms/%s/punishment/submit" % rid,
+        json={"punishment_type": "feynman_recall", "content": "任意内容"},
+        headers=other["headers"],
+    ).status_code == 403

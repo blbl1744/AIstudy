@@ -12,6 +12,7 @@
 3. 校验以规则质量校验为主；配置 LLM Key 时可选用 llm_semantic_review 做轻量语义加强；
 4. 所有注释使用中文，本模块不落盘任何报告文件。
 """
+import asyncio
 import re
 import time
 
@@ -293,3 +294,44 @@ def verify_punishment_submission(
         "punishment_type": ptype,
         "unlocked": unlocked,
     }
+
+
+async def verify_punishment_with_llm(
+    punishment_type: str, content, goal_text: str,
+    room: dict = None, timeout: float = 8.0,
+) -> dict:
+    """统一惩罚提交校验：本地规则校验 + 可选 LLM 语义复核（8 秒超时降级）。
+
+    - 规则未通过：直接返回拒绝 verdict，不调用 LLM；
+    - 规则通过：await 语义复核，超时或异常一律降级为规则结果放行，绝不挂起前端提交；
+      语义复核明确判定不通过时按拒绝处理；
+    - 最终放行且传入 room：复用 verify_punishment_submission 完成解锁。
+    无论语义服务状态如何都必有返回，杜绝「等待校验」永久卡死。
+    """
+    rule_verdict = verify_punishment_submission(
+        punishment_type, content, goal_text, room=None,
+    )
+    if not rule_verdict["passed"]:
+        return rule_verdict
+    try:
+        semantic_ok = await asyncio.wait_for(
+            llm_semantic_review(
+                punishment_type,
+                str(content if content is not None else ""),
+                goal_text,
+            ),
+            timeout=timeout,
+        )
+        if not semantic_ok:
+            return {
+                "passed": False,
+                "reason": "语义复核未通过，请围绕学习目标给出真实具体的内容",
+                "punishment_type": rule_verdict.get("punishment_type", punishment_type),
+                "unlocked": False,
+            }
+    except asyncio.TimeoutError:
+        logger.warning("惩罚语义复核超时（%.1f 秒），降级为本地规则校验结果放行", timeout)
+    except Exception as exc:
+        logger.warning("惩罚语义复核异常，降级为本地规则校验结果放行：%s", exc)
+    # 最终放行：再跑一次规则校验以完成房间解锁（复用同一套解锁逻辑）
+    return verify_punishment_submission(punishment_type, content, goal_text, room=room)

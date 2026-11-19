@@ -49,6 +49,8 @@ export const useRoomStore = defineStore('room', () => {
   const dialogueActive = ref(false)
   const lastInteraction = ref<RoomInteraction | null>(null)
   const sentinelMessage = ref('')
+  // 互动音效开关（督学官弹幕音效），由左下控制条与 HUD 共享，避免悬浮按钮遮挡聊天栏
+  const interactionSoundOn = ref(true)
   // WebSocket 实例非响应式对象，用 shallowRef 避免深层代理
   const socket = shallowRef<RoomSocket | null>(null)
 
@@ -164,10 +166,7 @@ export const useRoomStore = defineStore('room', () => {
 
     ws.on('punishment_cleared', (msg) => {
       // 解锁（或护盾抵消）后同步清空惩罚现场与走神累计，防止前端立即复弹进度条
-      isLocked.value = false
-      activePunishment.value = ''
-      strikesLeft.value = typeof msg.strikes_left === 'number' ? msg.strikes_left : 3
-      distractedStreakSec.value = 0
+      applyPunishmentCleared(msg.strikes_left)
     })
 
     ws.on('room_locked', () => {
@@ -204,9 +203,44 @@ export const useRoomStore = defineStore('room', () => {
     })
   }
 
+  /**
+   * 应用惩罚解锁后的统一现场：清空惩罚、恢复机会、清零走神累计。
+   * WS 回执与 HTTP 兜底共用，避免两处状态更新逻辑漂移。
+   */
+  function applyPunishmentCleared(strikesLeftValue?: number): void {
+    isLocked.value = false
+    activePunishment.value = ''
+    strikesLeft.value = typeof strikesLeftValue === 'number' ? strikesLeftValue : 3
+    distractedStreakSec.value = 0
+  }
+
+  /**
+   * 惩罚提交 HTTP 兜底：WS 未连接或未收到回执时调用。
+   * 后端复用同一套校验并广播 punishment_cleared；若此刻 WS 已断开收不到广播，
+   * 则依据 HTTP 返回的 passed 在本地同步解锁，彻底避免按钮卡死。
+   */
+  async function submitPunishmentHttp(
+    punishmentType: string,
+    content: string,
+  ): Promise<{ passed: boolean; reason: string }> {
+    const res = await roomApi.punishmentSubmit(roomId.value, {
+      punishment_type: punishmentType,
+      content,
+    })
+    if (res.passed) {
+      applyPunishmentCleared(res.strikes_left)
+    }
+    return { passed: res.passed, reason: res.reason ?? '' }
+  }
+
   /** 上行发送包装 */
   function send(msg: WsOutgoingMsg): boolean {
     return socket.value?.send(msg) ?? false
+  }
+
+  /** WS 是否处于已连接状态，供提交惩罚时选择 WS 或 HTTP 通道 */
+  function isSocketConnected(): boolean {
+    return socket.value?.isConnected ?? false
   }
 
   /** 清空房间态（离开房间时调用） */
@@ -227,6 +261,7 @@ export const useRoomStore = defineStore('room', () => {
     dialogueActive.value = false
     lastInteraction.value = null
     sentinelMessage.value = ''
+    interactionSoundOn.value = true
     dialogueSeq = 0
   }
 
@@ -245,6 +280,7 @@ export const useRoomStore = defineStore('room', () => {
     dialogueActive,
     lastInteraction,
     sentinelMessage,
+    interactionSoundOn,
     socket,
     strikesUsed,
     subtitleText,
@@ -255,6 +291,8 @@ export const useRoomStore = defineStore('room', () => {
     applyDialogueHistory,
     createSocket,
     send,
+    isSocketConnected,
+    submitPunishmentHttp,
     reset,
   }
 })

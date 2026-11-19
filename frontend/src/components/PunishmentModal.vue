@@ -2,7 +2,9 @@
 /**
  * 建设性惩罚弹窗：监听 roomStore.isLocked，锁房时弹出不可关闭遮罩。
  * 按 activePunishment 切换三种界面：费曼输出 / 目标拆解 / 5 分钟战损冲刺。
- * 提交经 WebSocket 上行 punishment_submit；punishment_cleared 由 store 自动解锁，
+ * 提交优先走 WebSocket；WS 未连接或 10 秒未收到回执时自动改用 HTTP 兜底接口，
+ * 双通道确保按钮绝不永久卡在"等待校验..."。
+ * punishment_cleared 由 store 自动解锁并在组件层清空输入/关闭弹窗，
  * punishment_rejected 在组件层订阅并展示退回原因（store 未订阅该消息）。
  * 全部后端文本以 {{ }} 插值渲染，严禁 v-html。
  */
@@ -72,11 +74,56 @@ const rejectReason = ref('')
 const formError = ref('')
 const submitting = ref(false)
 
+// 提交校验超时兜底：10 秒未收到 WS 回执即自动改走 HTTP 接口
+let verifyTimer: number | null = null
+function clearVerifyTimer(): void {
+  if (verifyTimer !== null) {
+    window.clearTimeout(verifyTimer)
+    verifyTimer = null
+  }
+}
+
+type SubmitPayload = { punishment_type: string; content: string }
+
+/** 走 HTTP 兜底接口提交，无论通过与否都解除 loading，绝不永久卡死 */
+async function submitViaHttp(payload: SubmitPayload): Promise<void> {
+  submitting.value = true
+  clearVerifyTimer()
+  try {
+    const res = await room.submitPunishmentHttp(payload.punishment_type, payload.content)
+    submitting.value = false
+    if (res.passed) {
+      // store 已在 submitPunishmentHttp 内解锁（isLocked=false），watch 会清空表单关闭弹窗
+      feynmanText.value = ''
+      breakdownText.value = ''
+      formError.value = ''
+      rejectReason.value = ''
+    } else {
+      rejectReason.value = res.reason || '校验未通过，请修改后重试'
+    }
+  } catch {
+    submitting.value = false
+    rejectReason.value = '校验服务暂不可用，请检查网络后重试'
+  }
+}
+
+/** 启动 10 秒超时保护，到点仍未收到回执则自动降级为 HTTP 提交 */
+function armVerifyTimer(payload: SubmitPayload): void {
+  clearVerifyTimer()
+  verifyTimer = window.setTimeout(() => {
+    verifyTimer = null
+    if (submitting.value) {
+      void submitViaHttp(payload)
+    }
+  }, 10_000)
+}
+
 /** 锁房开启时初始化：清空表单、重置倒计时与提示 */
 watch(
   () => room.isLocked,
   (locked) => {
     if (locked) {
+      clearVerifyTimer()
       feynmanText.value = ''
       breakdownText.value = ''
       rejectReason.value = ''
@@ -115,11 +162,13 @@ watch(
         rejectReason.value = ''
       }),
       ws.on('punishment_rejected', (msg) => {
+        clearVerifyTimer()
         rejectReason.value = msg.reason
         submitting.value = false
       }),
       ws.on('punishment_cleared', () => {
         // 解锁成功：清空输入并停止计时，store 已将 isLocked 置 false，弹窗随之关闭
+        clearVerifyTimer()
         feynmanText.value = ''
         breakdownText.value = ''
         rejectReason.value = ''
@@ -153,20 +202,35 @@ function submit(): void {
   }
 
   formError.value = ''
-  const ok = room.send({
-    type: 'punishment_submit',
+  rejectReason.value = ''
+  const payload: SubmitPayload = {
     punishment_type: currentType.value,
     content,
-  })
-  if (!ok) {
-    formError.value = '连接未就绪，提交失败，请稍后重试'
+  }
+
+  // WS 未连接时直接走 HTTP 兜底，避免消息发出后石沉大海
+  if (!room.isSocketConnected()) {
+    void submitViaHttp(payload)
     return
   }
+  const ok = room.send({
+    type: 'punishment_submit',
+    punishment_type: payload.punishment_type,
+    content: payload.content,
+  })
+  if (!ok) {
+    // 发送瞬间失败同样降级为 HTTP，杜绝卡死
+    void submitViaHttp(payload)
+    return
+  }
+  // WS 已发出：进入等待校验态，并挂 10 秒超时兜底
   submitting.value = true
+  armVerifyTimer(payload)
 }
 
 onBeforeUnmount(() => {
   stopSprint()
+  clearVerifyTimer()
   unsubscribers.forEach((u) => u())
 })
 </script>

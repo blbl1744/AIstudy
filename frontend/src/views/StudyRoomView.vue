@@ -30,6 +30,13 @@ const currentRoomId = computed(() => {
   return Array.isArray(value) ? value[0] ?? '' : value ?? ''
 })
 
+// 房间号紧凑缩略展示，避免长号撑宽顶部信息卡遮挡中央 HUD；完整号通过 title 悬停查看
+const shortRoomId = computed(() => {
+  const id = currentRoomId.value
+  if (!id || id.length <= 13) return id
+  return `${id.slice(0, 8)}…${id.slice(-4)}`
+})
+
 // ===== 一、场景恢复：优先内存态，其次房间详情，最后退回预设首项 =====
 const sceneForRender = computed(() => sceneStore.activeScene)
 // 目标文本优先取现场恢复值，其次取房间详情，避免刷新/暂离回来后目标丢失
@@ -268,7 +275,7 @@ onBeforeUnmount(() => {
           <div class="goal-box">
             <div class="room-id-line">
               <span class="room-id-label">房间号</span>
-              <span class="room-id-value">{{ currentRoomId }}</span>
+              <span class="room-id-value" :title="currentRoomId">{{ shortRoomId }}</span>
               <button type="button" class="room-copy-btn" @click="copyRoomId">复制房间号</button>
               <button type="button" class="room-copy-btn" @click="copyWatchLink">复制督学链接</button>
               <span v-if="copyTip" class="copy-tip">{{ copyTip }}</span>

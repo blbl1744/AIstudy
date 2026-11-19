@@ -47,13 +47,9 @@ async function pollSnapshot(): Promise<void> {
     hasFrame.value = true
     waitingHost.value = false
   } catch {
-    // 404 / 暂无画面：回收旧帧并回到"等待推流"占位
-    if (snapshotUrl.value) {
-      URL.revokeObjectURL(snapshotUrl.value)
-      snapshotUrl.value = ''
-    }
-    hasFrame.value = false
-    waitingHost.value = true
+    // 请求偶发失败（WS 抖动/重连瞬间）：保留已拿到的最后一帧，绝不因重连清空画面。
+    // 仅当从未拿到有效帧时才回到"等待推流"占位。
+    if (!hasFrame.value) waitingHost.value = true
   }
 }
 
@@ -257,7 +253,14 @@ onMounted(async () => {
     }),
   )
   socket.connect()
-  startPolling()
+  // 只要房主在线（host_online !== false）就立即拉取一次并按 1.5s 轮询；
+  // 房主暂离时仅显示等待占位，明确离线不发起无效快照请求。
+  if (meta.host_online !== false) {
+    startPolling()
+  } else {
+    hostAway.value = true
+    waitingHost.value = false
+  }
 })
 
 onBeforeUnmount(() => {
