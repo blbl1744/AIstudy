@@ -119,6 +119,9 @@ watch(
         submitting.value = false
       }),
       ws.on('punishment_cleared', () => {
+        // 解锁成功：清空输入并停止计时，store 已将 isLocked 置 false，弹窗随之关闭
+        feynmanText.value = ''
+        breakdownText.value = ''
         rejectReason.value = ''
         formError.value = ''
         submitting.value = false

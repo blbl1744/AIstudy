@@ -58,6 +58,31 @@ if not logger.handlers:
 
 # ========== 先加载配置 ==========
 
+# ========== 根目录 .env 加载（纯标准库，无新增依赖） ==========
+# 启动时读取项目根目录 .env，把 KEY=VALUE 以 os.environ.setdefault 注入环境变量：
+# 仅注入进程尚未设置的变量，保证「环境变量优先、.env 兜底」，便于容器用环境变量覆盖密钥。
+# 必须在下方 LLM_* 读取之前执行，确保 AI_STUDY_LLM_API_KEY 等配置生效。
+_ENV_PATH = os.path.join(BASE_DIR, ".env")
+if os.path.isfile(_ENV_PATH):
+    try:
+        with open(_ENV_PATH, "r", encoding="utf-8") as _env_file:
+            for _raw_line in _env_file:
+                _line = _raw_line.strip()
+                # 跳过空行与注释行
+                if not _line or _line.startswith("#"):
+                    continue
+                # 仅在首个 = 处切分，值里允许再含 =；去掉两侧空白与包裹引号
+                if "=" not in _line:
+                    continue
+                _env_key, _env_value = _line.split("=", 1)
+                _env_key = _env_key.strip()
+                _env_value = _env_value.strip().strip('"').strip("'")
+                if _env_key:
+                    os.environ.setdefault(_env_key, _env_value)
+    except OSError as _env_err:
+        # .env 读取失败不阻塞服务启动，仅记录告警
+        logger.warning("根目录 .env 读取失败，已忽略：%s", _env_err)
+
 # ========== 根目录 config.py 加载（避免与 app/config.py 同名遮蔽） ==========
 # 说明：项目根目录存在用户自建的 config.py（存放密钥等不入库配置），本文件同在 app 包内，
 # 若直接 `import config`，不同启动方式（python app/main.py / uvicorn app.main:app）会解析到不同文件。
@@ -160,6 +185,8 @@ AUTO_ALERT_COOLDOWN = int(os.getenv("AI_STUDY_AUTO_ALERT_COOLDOWN", "60"))
 LLM_BASE_URL = (os.getenv("AI_STUDY_LLM_BASE_URL") or "https://api.openai.com/v1").strip()
 # 大模型 API Key：留空时编译器跳过在线生成，直接平滑回退内置离线剧本
 LLM_API_KEY = (os.getenv("AI_STUDY_LLM_API_KEY") or "").strip()
+# 是否已配置大模型 Key：供健康检查与前端离线提示使用（配置 Key 即可开启自由问答）
+LLM_ENABLED = bool(LLM_API_KEY)
 # 剧本编译使用的模型名
 LLM_MODEL = (os.getenv("AI_STUDY_LLM_MODEL") or "gpt-4o-mini").strip()
 # 连续走神累计达到该秒数判定为一次有效失误（扣 1 点生命值）；用 float 便于单测压缩

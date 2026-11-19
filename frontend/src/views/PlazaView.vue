@@ -189,6 +189,39 @@ function isMyRoom(room: PlazaRoom): boolean {
   return room.host_id === userStore.profile?.id
 }
 
+/** 我的进行中房间：置顶展示，房主暂离后仍可凭此返回学习室 */
+const myRooms = computed(() => rooms.value.filter(isMyRoom))
+/** 他人房间：常规广场列表 */
+const otherRooms = computed(() => rooms.value.filter((room) => !isMyRoom(room)))
+
+// ===== 六·五、凭房间号加入督学 =====
+const joinInput = ref('')
+const joinError = ref('')
+
+/** 从纯房间号或 /watch/<id> 完整链接中提取房间 ID */
+function extractRoomId(raw: string): string {
+  const text = raw.trim()
+  if (!text) return ''
+  const match = text.match(/\/watch\/([^/?#]+)/)
+  if (match) return decodeURIComponent(match[1])
+  return text.replace(/^\/+|\/+$/g, '')
+}
+
+/** 凭号/链接进入督学：本人房间直达学习室，其余进入围观视角 */
+function joinByRoomId(): void {
+  const roomId = extractRoomId(joinInput.value)
+  if (!roomId) {
+    joinError.value = '请输入房间号或督学链接'
+    return
+  }
+  joinError.value = ''
+  if (rooms.value.some((room) => room.room_id === roomId && isMyRoom(room))) {
+    router.push({ name: 'study', params: { roomId } })
+  } else {
+    router.push({ name: 'watch', params: { roomId } })
+  }
+}
+
 /**
  * 进入房间：本人房间跳学习室（继续/恢复本局），他人房间跳督学视角。
  */
@@ -370,31 +403,60 @@ onBeforeUnmount(() => {
           <button type="button" class="refresh-btn" @click="loadPlaza">刷新</button>
         </div>
 
+        <!-- 凭房间号加入督学：支持纯房间号或 /watch/<id> 完整链接 -->
+        <div class="join-by-id">
+          <input
+            v-model="joinInput"
+            type="text"
+            class="join-input"
+            maxlength="200"
+            placeholder="输入房间号或督学链接加入督学"
+            @keyup.enter="joinByRoomId"
+          />
+          <button type="button" class="join-btn" @click="joinByRoomId">进入</button>
+          <p v-if="joinError" class="error-hint">{{ joinError }}</p>
+        </div>
+
+        <!-- 我的进行中房间：置顶展示，暂离后可从这里一键返回学习室 -->
+        <div v-if="myRooms.length > 0" class="my-rooms">
+          <div class="my-rooms-title">我的进行中房间</div>
+          <article
+            v-for="room in myRooms"
+            :key="room.room_id"
+            class="room-card room-card--mine"
+          >
+            <div class="room-mode">
+              我的进行中房间
+              <span v-if="!room.host_online" class="room-away">暂离中</span>
+              <span v-else class="room-online">在线</span>
+            </div>
+            <div class="room-id-tag">房间号：{{ room.room_id }}</div>
+            <h3 class="room-title">{{ room.scene_title }}</h3>
+            <p class="room-goal">{{ room.goal_text }}</p>
+            <button type="button" class="enter-btn" @click="enterWatch(room)">返回学习室</button>
+          </article>
+        </div>
+
         <p v-if="loading" class="hint">正在扫描广场信号...</p>
         <p v-else-if="loadError" class="error-hint">{{ loadError }}</p>
-        <p v-else-if="rooms.length === 0" class="hint">当前暂无公开房间，成为第一个开房的人吧。</p>
+        <p v-else-if="otherRooms.length === 0" class="hint">当前暂无他人公开房间，成为第一个开房的人吧。</p>
 
         <div v-else class="room-grid">
           <article
-            v-for="room in rooms"
+            v-for="room in otherRooms"
             :key="room.room_id"
             class="room-card"
-            :class="{ 'room-card--mine': isMyRoom(room) }"
           >
-            <div class="room-mode">
-              {{ isMyRoom(room) ? '我的进行中房间' : modeLabel(room.mode) }}
-              <span v-if="isMyRoom(room) && !room.host_online" class="room-away">暂离中</span>
-            </div>
+            <div class="room-mode">{{ modeLabel(room.mode) }}</div>
+            <div class="room-id-tag">房间号：{{ room.room_id }}</div>
             <h3 class="room-title">{{ room.scene_title }}</h3>
             <p class="room-goal">{{ room.goal_text }}</p>
             <div class="room-meta">
-              <span>房主：{{ isMyRoom(room) ? '我' : room.host_nickname }}</span>
+              <span>房主：{{ room.host_nickname }}</span>
               <span>已坚持 {{ room.elapsed_seconds }} 秒</span>
               <span>在线督学 {{ room.watcher_count }}/{{ room.max_watchers }}</span>
             </div>
-            <button type="button" class="enter-btn" @click="enterWatch(room)">
-              {{ isMyRoom(room) ? '返回学习室' : '进入督学' }}
-            </button>
+            <button type="button" class="enter-btn" @click="enterWatch(room)">进入督学</button>
           </article>
         </div>
       </section>
@@ -732,6 +794,73 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 14px;
+}
+/* 凭号加入：输入框 + 进入按钮 */
+.join-by-id {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+  background: rgba(0, 229, 255, 0.05);
+  border: 1px dashed rgba(0, 229, 255, 0.3);
+  border-radius: 8px;
+}
+.join-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: #e6f1ff;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  border-radius: 5px;
+  outline: none;
+}
+.join-input:focus { border-color: #00e5ff; }
+.join-btn {
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #04121a;
+  background: #00e5ff;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.join-by-id .error-hint { flex-basis: 100%; }
+/* 我的进行中房间：置顶横条 */
+.my-rooms {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 12px;
+  background: rgba(255, 214, 102, 0.05);
+  border: 1px solid rgba(255, 214, 102, 0.3);
+  border-radius: 10px;
+}
+.my-rooms-title {
+  grid-column: 1 / -1;
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffd666;
+  letter-spacing: 1px;
+}
+.room-id-tag {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #ffd666;
+  user-select: all;
+}
+.room-online {
+  margin-left: 6px;
+  font-size: 10px;
+  color: #5ce0a0;
+  border: 1px solid rgba(92, 224, 160, 0.5);
+  border-radius: 999px;
+  padding: 1px 8px;
 }
 .room-card {
   padding: 16px;

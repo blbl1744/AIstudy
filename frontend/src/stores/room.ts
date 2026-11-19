@@ -163,11 +163,11 @@ export const useRoomStore = defineStore('room', () => {
     })
 
     ws.on('punishment_cleared', (msg) => {
+      // 解锁（或护盾抵消）后同步清空惩罚现场与走神累计，防止前端立即复弹进度条
       isLocked.value = false
       activePunishment.value = ''
-      if (typeof msg.strikes_left === 'number') {
-        strikesLeft.value = msg.strikes_left
-      }
+      strikesLeft.value = typeof msg.strikes_left === 'number' ? msg.strikes_left : 3
+      distractedStreakSec.value = 0
     })
 
     ws.on('room_locked', () => {

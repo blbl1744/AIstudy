@@ -8,6 +8,7 @@ M1-B 核心守护用例（test_core）
 """
 import base64
 import copy
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -180,6 +181,9 @@ def test_health_auth_growth_cleanup(client):
     assert health.status_code == 200, health.text
     body = health.json()
     assert body["status"] == "ok" and body["database"] == "ok"
+    # 大模型配置状态透出：/api/health 须返回布尔型 llm_enabled 供前端离线提示
+    api_health = client.get("/api/health")
+    assert api_health.status_code == 200 and isinstance(api_health.json().get("llm_enabled"), bool)
     assert body["model"]["feature_dim"] == 13
     assert "active_rooms" in body["runtime"] and "room_connections" in body["runtime"]
 
@@ -257,6 +261,9 @@ def test_room_create_and_plaza(client):
     own_rooms = client.get("/api/rooms/plaza", headers=host["headers"]).json()["rooms"]
     own_ids = {r["room_id"] for r in own_rooms}
     assert pub["room_id"] in own_ids, "房主暂离后仍应能从广场返回本人房间"
+    # Bug②：ai_solo 与私密房在房主本人视角也必须可见（暂离返回闭环）
+    assert solo["room_id"] in own_ids, "本人 ai_solo 房暂离后仍应可见，供返回学习室"
+    assert priv["room_id"] in own_ids, "本人私密房暂离后仍应可见，供返回学习室"
     assert all("host_online" in r for r in own_rooms), "广场条目须带 host_online 供前端标注暂离"
 
     # 督学官视角：公开小组房间可见，ai_solo 与私密房间不可见
@@ -575,7 +582,18 @@ def test_three_strikes_shield_and_punishment(client, monkeypatch):
         "掌握编译原理词法分析", room=feynman_room,
     )
     assert ok["passed"] and ok["unlocked"]
-    assert feynman_room["is_locked"] is False and feynman_room["strikes_left"] == 1
+    # Bug①：解锁须彻底重置为 3 次机会、清空惩罚现场与走神累计，并设 10 秒保护期
+    assert feynman_room["is_locked"] is False
+    assert feynman_room["strikes_left"] == 3, "解锁后须恢复 3 次机会，而非 1 次"
+    assert feynman_room.get("active_punishment") in ("", None), "解锁后须清空惩罚现场"
+    assert feynman_room.get("distracted_streak_sec") == 0.0, "解锁后须清零走神累计"
+    assert feynman_room.get("grace_until", 0) > time.time(), "解锁后须设置未来 10 秒保护期"
+    # 保护期内持续走神也不得扣血、不得重新锁房（防立即复弹）
+    grace_left_before = feynman_room["strikes_left"]
+    g1 = pun.evaluate_strike(feynman_room, True, 100.0)
+    assert g1["strikes_left"] == grace_left_before and not g1["is_locked"], \
+        "10 秒保护期内不得扣血或重新锁房"
+    assert g1.get("event") is None, "保护期内不应产生任何 strike 事件"
     # 敷衍内容应被拒绝
     bad = pun.verify_punishment_submission("feynman_recall", "哈哈哈哈哈哈", "目标",
                                            room=_fresh_room(is_locked=True))

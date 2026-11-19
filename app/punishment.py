@@ -13,6 +13,7 @@
 4. 所有注释使用中文，本模块不落盘任何报告文件。
 """
 import re
+import time
 
 from . import config
 from .config import LLM_API_KEY, logger
@@ -79,6 +80,13 @@ def evaluate_strike(room: dict, is_distracted: bool, dt: float) -> dict:
 
     # 已锁定或本就无生命值：幂等返回，避免重复扣血/重复扣盾
     if result["is_locked"] or strikes_left <= 0:
+        return result
+
+    # 解锁后的 10 秒保护期：继续累计但暂不扣血/锁房，防止刚解锁又立即复弹
+    # 时钟与 verify 解锁时一致用 time.time()，避免与帧间隔的单调时钟混用
+    if time.time() < float(room.get("grace_until", 0) or 0):
+        room["distracted_streak_sec"] = 0.0
+        result["distracted_streak_sec"] = 0.0
         return result
 
     # 防误判缓冲：端正坐姿立即清零当前累计
@@ -268,11 +276,15 @@ def verify_punishment_submission(
 
     unlocked = False
     if passed and isinstance(room, dict):
+        # 解锁后彻底重置三次机会与惩罚现场，并给 10 秒保护期防止刚解锁又立即复弹
         room["is_locked"] = False
-        room["strikes_left"] = 1
+        room["strikes_left"] = 3
         room["punishment_type"] = ""
+        room["active_punishment"] = ""       # 清空惩罚现场，前端据此关闭惩罚弹窗
+        room["distracted_streak_sec"] = 0.0  # 清空走神连续累计，避免保护期后立刻补扣
+        room["grace_until"] = time.time() + 10  # 10 秒保护期内跳过扣血与锁房判定
         unlocked = True
-        logger.info("惩罚校验通过，房间 %s 已解锁并恢复 1 点生命值（类型：%s）",
+        logger.info("惩罚校验通过，房间 %s 已解锁并重置 3 次机会（10 秒保护期，类型：%s）",
                     room.get("room_id", "-"), ptype)
 
     return {

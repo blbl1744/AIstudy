@@ -17,6 +17,7 @@ from . import model_loader
 from .config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
+    LLM_ENABLED,
     logger,
 )
 from .db import get_db, init_db
@@ -107,8 +108,16 @@ async def healthz():
             "active_rooms": len(active_rooms),
             "room_connections": sum(len(peers) for peers in room_connections.values()),
         },
+        # 是否已配置大模型 Key：前端据此判断是否展示「离线剧本模式」提示
+        "llm_enabled": LLM_ENABLED,
     }
     return JSONResponse(status_code=200 if database_ok else 503, content=payload)
+
+
+@app.get("/api/health")
+async def api_health():
+    """前端可读的运行配置：仅透出是否启用大模型，供对话面板展示离线/在线角标"""
+    return {"status": "ok", "llm_enabled": LLM_ENABLED}
 
 
 if __name__ == "__main__":

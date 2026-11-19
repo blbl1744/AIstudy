@@ -4,9 +4,18 @@
 // ai_audio_chunk 未在 store 订阅，此处在组件层直接订阅 socket 并解码播放。
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
+import { systemApi } from '@/api/http'
 import type { RoomSocket } from '@/api/roomSocket'
 
 const room = useRoomStore()
+
+// 大模型在线状态：默认按离线处理，挂载后由 /api/health 校准
+const llmEnabled = ref(false)
+onMounted(() => {
+  systemApi.health()
+    .then((data) => { llmEnabled.value = Boolean(data.llm_enabled) })
+    .catch(() => { llmEnabled.value = false })
+})
 
 // ===== 一、流式字幕打字机 =====
 interface Bubble {
@@ -233,6 +242,8 @@ onBeforeUnmount(() => {
       <div class="chat-header__title">
         <span class="chat-header__dot"></span>
         指挥官频道
+        <!-- 离线剧本模式提示：未配置 LLM Key 时温和告知，不影响正常使用 -->
+        <span v-if="!llmEnabled" class="chat-offline-badge">当前为离线剧本模式，配置 LLM Key 可开启自由问答</span>
       </div>
       <button
         type="button"
@@ -328,6 +339,17 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: var(--scene-primary, #00e5ff);
   box-shadow: 0 0 8px var(--scene-primary, #00e5ff);
+}
+.chat-offline-badge {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: #b9a674;
+  background: rgba(185, 166, 116, 0.12);
+  border: 1px solid rgba(185, 166, 116, 0.35);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
 }
 .voice-toggle {
   padding: 3px 10px;

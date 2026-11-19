@@ -135,6 +135,55 @@ function stopCamera(): void {
   cameraOn.value = false
 }
 
+// ===== 二·五、房间号与督学链接复制 =====
+const copyTip = ref('')
+
+/** 通用剪贴板写入：优先 Clipboard API，失败时降级到临时 textarea + execCommand */
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Clipboard API 不可用时走降级路径
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/** 短暂展示复制成功提示，2 秒后自动淡出 */
+function showCopyTip(text: string): void {
+  copyTip.value = text
+  window.setTimeout(() => {
+    if (copyTip.value === text) copyTip.value = ''
+  }, 2000)
+}
+
+/** 复制纯房间号 */
+async function copyRoomId(): Promise<void> {
+  const ok = await writeClipboard(currentRoomId.value)
+  showCopyTip(ok ? '房间号已复制' : '复制失败，请手动复制房间号')
+}
+
+/** 复制完整督学链接（/watch/:roomId） */
+async function copyWatchLink(): Promise<void> {
+  const link = `${window.location.origin}/watch/${currentRoomId.value}`
+  const ok = await writeClipboard(link)
+  showCopyTip(ok ? '督学链接已复制' : '复制失败，请手动复制链接')
+}
+
 // ===== 三、WebSocket 生命周期与战报 =====
 interface BattleReport {
   duration_minutes: number
@@ -214,9 +263,16 @@ onBeforeUnmount(() => {
   <div class="study-page">
     <SceneRenderer v-if="sceneForRender" :scene="sceneForRender">
       <div class="study-layout">
-        <!-- 顶部：学习目标与操作栏 -->
+        <!-- 顶部：房间号、学习目标与操作栏 -->
         <header class="study-topbar">
           <div class="goal-box">
+            <div class="room-id-line">
+              <span class="room-id-label">房间号</span>
+              <span class="room-id-value">{{ currentRoomId }}</span>
+              <button type="button" class="room-copy-btn" @click="copyRoomId">复制房间号</button>
+              <button type="button" class="room-copy-btn" @click="copyWatchLink">复制督学链接</button>
+              <span v-if="copyTip" class="copy-tip">{{ copyTip }}</span>
+            </div>
             <span class="goal-label">本局目标</span>
             <span class="goal-text">{{ goalText }}</span>
           </div>
@@ -334,6 +390,7 @@ onBeforeUnmount(() => {
 .goal-box {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 8px 14px;
   background: rgba(0, 0, 0, 0.45);
@@ -342,6 +399,31 @@ onBeforeUnmount(() => {
   font-size: 14px;
   max-width: 60%;
 }
+.room-id-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-basis: 100%;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.15);
+}
+.room-id-label { opacity: 0.7; font-size: 12px; white-space: nowrap; }
+.room-id-value {
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--scene-primary, #00e5ff);
+  user-select: all;
+}
+.room-copy-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--scene-primary, #00e5ff);
+  background: transparent;
+  border: 1px solid var(--scene-primary, #00e5ff);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.copy-tip { font-size: 11px; color: #6ee7a8; }
 .goal-label { opacity: 0.7; font-size: 12px; white-space: nowrap; }
 .goal-text { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-actions { display: flex; align-items: center; gap: 10px; }

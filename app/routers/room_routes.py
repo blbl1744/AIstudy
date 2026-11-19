@@ -170,14 +170,16 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
 # ========== REST：公告广场 ==========
 @router.get("/api/rooms/plaza")
 async def plaza(user: dict = Depends(get_current_user)):
-    """返回所有公开、非 ai_solo 的活跃房间快照（不过滤本人房间，供房主暂离后返回）"""
-    _current_user_id(user)  # 鉴权：确保调用方已登录
+    """公开广场快照：本人房间无论模式/公开/在线状态一律可见（供暂离返回），他人仅公开非单机房"""
+    user_id = _current_user_id(user)  # 鉴权并取当前用户 id
     now = _now_ts()
     result = []
     for _, room in state.active_rooms.items():
         if not isinstance(room, dict):
             continue
-        if not room.get("is_public") or room.get("mode") == "ai_solo":
+        is_mine = room.get("host_id") == user_id
+        # 他人房间：仅展示公开且非 ai_solo 的；本人房间无条件保留（含 ai_solo / 私密 / 暂离）
+        if not is_mine and (not room.get("is_public") or room.get("mode") == "ai_solo"):
             continue
         result.append({
             "room_id": room.get("room_id"),
@@ -551,7 +553,7 @@ async def room_ws(websocket: WebSocket, room_id: str):
                         await _broadcast(room_id, {
                             "type": "punishment_cleared",
                             "shield_saved": False,
-                            "strikes_left": room.get("strikes_left", 1),
+                            "strikes_left": room.get("strikes_left", 3),
                         })
                     else:
                         await websocket.send_json({

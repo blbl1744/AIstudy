@@ -99,6 +99,12 @@ export const roomApi = {
   snapshotUrl: (roomId: string): string => `/api/rooms/${roomId}/snapshot.jpg`,
 }
 
+/** 运行配置接口：供前端判断是否处于大模型离线剧本模式 */
+export const systemApi = {
+  health: (): Promise<{ status: string; llm_enabled: boolean }> =>
+    http.get<{ status: string; llm_enabled: boolean }>('/health').then((res) => res.data),
+}
+
 /** 战报明细与 CSV 导出接口（M5） */
 export const statsApi = {
   /** 单局战报详情：摘要 + 专注度采样点 */
