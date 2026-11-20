@@ -1,0 +1,33 @@
+# AIstudy 前后端一键编排（M5 收官）
+# 用法：docker compose up --build -d ；访问 http://localhost
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      AI_STUDY_JWT_SECRET: ${AI_STUDY_JWT_SECRET:-change-me-at-least-32-characters-long}
+      AI_STUDY_DB: /data/ai_study_buddy.db
+      AI_STUDY_CORS_ORIGINS: ${AI_STUDY_CORS_ORIGINS:-http://localhost,http://127.0.0.1}
+      AI_STUDY_LLM_API_KEY: ${AI_STUDY_LLM_API_KEY:-}
+      AI_STUDY_LLM_BASE_URL: ${AI_STUDY_LLM_BASE_URL:-https://api.openai.com/v1}
+      AI_STUDY_LLM_MODEL: ${AI_STUDY_LLM_MODEL:-gpt-4o-mini}
+    volumes:
+      # SQLite 数据库落在命名卷，容器重建不丢数据
+      - ai_study_data:/data
+    expose:
+      - "8001"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  ai_study_data:
