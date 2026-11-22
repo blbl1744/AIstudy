@@ -31,6 +31,7 @@ from ..analyzer import analyzer
 from ..auth import get_current_user, verify_jwt_token
 from ..config import CORS_ALLOW_ORIGINS, logger
 from ..db import calc_rank_title, get_db, save_behavior_record
+from ..diagnostics import diagnostics
 from ..punishment import (
     evaluate_strike,
     verify_punishment_submission,
@@ -43,7 +44,7 @@ router = APIRouter()
 # ===== 哨兵预警参数（模块级常量，测试可 monkeypatch 压缩阈值）=====
 SENTINEL_ALERT_SEC = 8.0         # 连续走神达到该秒数触发预警
 SENTINEL_COOLDOWN_SEC = 30.0     # 同一房间两次预警的最小间隔（防刷屏）
-DISTRACTED_SCORE = 60            # focus_score 低于该值或为 None 视为走神
+DISTRACTED_SCORE = 60            # 缺 is_distracted 时的旧阈值：focus_score 低于该值视为走神；score=None 归 UNKNOWN
 SOUND_WHITELIST = {"knock_board", "clear_throat", "alarm", "cheer"}
 
 # ===== 建设性惩罚提示文案（三次机会耗尽时下发给学习者）=====
@@ -57,6 +58,42 @@ _PUNISHMENT_PROMPT = {
 def _punishment_prompt(ptype: str) -> str:
     """按惩罚类型返回解锁提示（非法类型回退费曼输出文案）"""
     return _PUNISHMENT_PROMPT.get(ptype, _PUNISHMENT_PROMPT["feynman_recall"])
+
+
+def _resolve_distraction(payload, score):
+    """确定最终走神裁决及其来源（纯函数，三态裁决）。
+
+    返回四元组 (final, decision_source, analyzer_is_distracted, legacy_fallback_used)：
+    裁决优先级（自高而低，最终修复统一）：
+      1) analyzer 显式 attention_state == "UNKNOWN"（引擎降级/关键点缺失兜底）→ 一律 UNKNOWN，
+         无论 is_distracted 是 True/False，绝不把兜底伪 False 当「确认未走神」（否则会清零累计）；
+      2) 有效 bool 型 is_distracted → 采用该值（True 确认走神 / False 确认未走神），
+         source=analyzer，analyzer_is_distracted=该值，legacy_fallback_used=False；
+      3) 无有效 bool 但 score 是有效数值 → 沿用旧阈值 score < DISTRACTED_SCORE，
+         source=legacy_fallback，analyzer_is_distracted=None，legacy_fallback_used=True；
+      4) 以上均不可用（score=None 且无有效 bool，典型：线程池推理异常 result=None）→ UNKNOWN
+         (None, "unknown", None, False)。
+
+    UNKNOWN 两种情况（显式 attention_state=UNKNOWN 与 result=None）统一返回
+    (None, "unknown", None, False)：analyzer_is_distracted 按字段定义记 None（未经有效性确认），
+    analyzer 原始兜底值不在此字段体现，而在帧级诊断 log_frame 按原始输出保留，二者可区分且不丢信息。
+    三态语义：True=确认走神 / False=确认未走神 / None=UNKNOWN（跳过惩罚、不动任何状态）。
+
+    该函数只做「读 payload + 判定来源」的纯计算，不写库、不落盘、不改变任何状态。
+    """
+    # 第一优先：显式 UNKNOWN 必须先看 attention_state，再看 is_distracted。
+    # 兜底帧的 is_distracted=False 是硬编码伪值，命中 bool 分支会误判「确认未走神」并清零累计。
+    if payload.get("attention_state") == "UNKNOWN":
+        return None, "unknown", None, False
+    if isinstance(payload.get("is_distracted"), bool):
+        final = payload["is_distracted"]
+        return final, "analyzer", final, False
+    if score is None:
+        # 缺失 bool 且无分数：无法判断，中性 UNKNOWN，绝不回退为「确认走神」或「确认未走神」
+        return None, "unknown", None, False
+    legacy = score < DISTRACTED_SCORE
+    return legacy, "legacy_fallback", None, True
+
 
 # WebSocket 握手失败关闭码
 WS_CLOSE_BAD_TOKEN = 4401        # JWT 缺失或无效
@@ -387,10 +424,37 @@ async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> 
     prev = room.get("last_frame_ts")
     delta = (now - prev) if prev is not None else 0.0
     room["last_frame_ts"] = now
-    distracted = (score is None) or (score < DISTRACTED_SCORE)
+    # 本次姿态算法迭代：走神判定优先采用 analyzer 的「多信号综合 + 防抖」结果 is_distracted，
+    # 使正常低头学习（HEAD_DOWN）不再因 focus_score 波动或无检测被误判为走神、累计扣血。
+    # 兼容回退：若上游 analyzer 未提供该字段（旧版本/第三方实现），沿用原有分数阈值逻辑，
+    # 保证 WS 消息结构与既有行为零漂移。
+    # 裁决来源追踪（第二阶段补充审查）：_resolve_distraction 三态裁决——
+    # analyzer 有效 bool 优先；缺 bool 但有数值走 DISTRACTED_SCORE 阈值兼容；
+    # 两者皆缺（analyzer 推理异常 result=None）返回 UNKNOWN，不再误判走神。
+    # 诊断关闭时 log_decision 立即返回，零落盘、零状态变更。
+    distracted, decision_source, analyzer_is_distracted, legacy_fallback_used = _resolve_distraction(payload, score)
+    diagnostics.log_decision({
+        "decision_source": decision_source,
+        "final_is_distracted": distracted,
+        "analyzer_is_distracted": analyzer_is_distracted,
+        "legacy_fallback_used": legacy_fallback_used,
+    })
 
     # 2.5) 惩罚引擎统一裁决：内部维护走神累计（走神累加、端正清零）、扣血与锁房状态
-    strike = evaluate_strike(room, distracted, delta)
+    # UNKNOWN（analyzer 推理异常 result=None）：不做惩罚裁决——传 False 会清零连续走神累计、
+    # 恢复护盾并改变房间状态，传 True 更会误扣血。这里跳过 evaluate_strike，构造中性结果：
+    # event=None 不触发任何惩罚联动，streak 取房间当前值且完全不写回 room；
+    # 后续行为记录保存、诊断日志、WS 广播与哨兵判定全部照常执行，仅惩罚状态机保持原样。
+    if distracted is None:
+        strike = {
+            "event": None,
+            "strikes_left": room.get("strikes_left", 3),
+            "shield_saved": False,
+            "punishment_type": room.get("punishment_type", ""),
+            "distracted_streak_sec": float(room.get("distracted_streak_sec", 0.0) or 0.0),
+        }
+    else:
+        strike = evaluate_strike(room, distracted, delta)
     streak_sec = float(strike.get("distracted_streak_sec") or 0.0)
 
     # 3) 分析结果广播给全房（生命值与走神时长均取引擎回写后的最新值）
@@ -426,10 +490,19 @@ async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> 
                 "prompt": _punishment_prompt(ptype),
             })
 
-    # 4) 哨兵预警：有督学官在线、连续走神达标且已过冷却期时，仅向督学官推送
+    # 4) 哨兵预警：有督学官在线、连续走神达标且已过冷却期时，仅向督学官推送。
+    # 最终修复（哨兵当前帧有效性约束）：必须【当前帧最终裁决明确为 True】才允许新的哨兵预警。
+    # 核心=只用当前帧确认走神这一有效证据触发，不得借用历史累计：
+    #   - UNKNOWN（引擎降级兜底 attention_state=UNKNOWN / 线程池异常 result=None）时
+    #     distracted is None，不满足 is True，故不触发新预警；且 UNKNOWN 帧走中性 strike，
+    #     完全不写回 room，distracted_streak_sec 历史累计不清零、不增长，原样保留；
+    #   - 确认未走神（False）也不触发，且惩罚引擎会清零累计（既有正常逻辑不变）；
+    #   - 恢复有效走神（True）后从保留的累计继续按正常规则判定，可正常触发预警。
+    # 复用当前帧裁决值 distracted 与既有冷却戳 _last_sentinel_alert_ts 即可实现，
+    # 无需新增独立哨兵有效性状态，也不复用/篡改惩罚计数器的写回流程。
     watchers = room.get("watchers") or {}
     last_alert = room.get("_last_sentinel_alert_ts") or 0.0
-    if watchers and room["distracted_streak_sec"] >= SENTINEL_ALERT_SEC \
+    if distracted is True and watchers and room["distracted_streak_sec"] >= SENTINEL_ALERT_SEC \
             and (now - last_alert) >= SENTINEL_COOLDOWN_SEC:
         room["_last_sentinel_alert_ts"] = now
         for wid in list(watchers.keys()):

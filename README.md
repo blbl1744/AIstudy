@@ -93,6 +93,9 @@
 | `AI_STUDY_LLM_MODEL` | 否 | `gpt-4o-mini` | 剧本编译与流式对话使用的模型名 |
 | `AI_STUDY_STRIKE_SECONDS` | 否 | `10` | 连续走神累计达该秒数判定为一次有效失误（扣 1 点生命值） |
 | `AI_STUDY_TTS_ENABLED` | 否 | `0` | `1`=启用 edge-tts 语音合成（需外网），`0`=关闭；失败静默降级为纯文本 |
+| `AI_STUDY_DIAGNOSTICS_ENABLED` | 否 | `0` | 姿态诊断日志：`1`=逐帧记录结构化字段用于真实摄像头验证，`0`=关闭（默认）；关闭时对评分/惩罚零副作用 |
+| `AI_STUDY_DIAGNOSTICS_FORMAT` | 否 | `jsonl` | 诊断日志导出格式：`jsonl` 或 `csv` |
+| `AI_STUDY_DIAGNOSTICS_DIR` | 否 | `logs/diagnostics` | 诊断日志目录；只写已计算字段，不写原始图像与敏感信息 |
 | `AI_STUDY_AUTO_ALERT_SECONDS` | 否 | `15` | 持续分心自动预警阈值（秒） |
 | `AI_STUDY_AUTO_ALERT_COOLDOWN` | 否 | `60` | 同一学生两次自动提醒的最小间隔（秒），防刷屏 |
 | `AI_STUDY_DEBUG_API` | 否 | 空（不注册） | `1`=注册 `/api/debug/*` 诊断接口；**生产必须保持为空或 `0`** |

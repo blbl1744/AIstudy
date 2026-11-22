@@ -117,21 +117,29 @@ def test_feature_contract(fake_landmarks):
 
 # ========== 2. 规则评分 ==========
 def test_rule_score_range(fake_landmarks):
-    """端正坐姿高分、低头+晃动明显掉分、无人时 focus_score 为 None"""
+    """端正坐姿高分；纯低头不扣分（本次迭代核心）；晃动仍按原规则扣分；无人时 focus_score 为 None"""
     good_score, good_head, good_body = _rule_chain(fake_landmarks)
     assert good_head == "端正", "端正坐姿应判定为端正，实际 %s" % good_head
     assert good_body == "稳定", "端正坐姿身体应判定为稳定，实际 %s" % good_body
     assert good_score >= 85, "端正坐姿规则分应 >= 85，实际 %s" % good_score
 
-    head_down = copy.deepcopy(fake_landmarks)
-    head_down[0].y = 0.58
-    head_down[23].x = 0.20
-    head_down[24].x = 0.32
+    # 仅低头（身体稳定）：姿态仍描述为「明显低头」，但不再扣分
+    pure_head_down = copy.deepcopy(fake_landmarks)
+    pure_head_down[0].y = 0.58
+    down_score, down_head, down_body = _rule_chain(pure_head_down)
+    assert down_head == "明显低头", "应判定明显低头，实际 %s" % down_head
+    assert down_body == "稳定"
+    assert down_score >= good_score - 1, "正常低头不应扣分：%s -> %s" % (good_score, down_score)
 
-    bad_score, bad_head, bad_body = _rule_chain(head_down)
+    # 低头 + 明显晃动：低头不扣，但晃动仍按 body_major 扣分（不再叠加低头扣分）
+    shaky = copy.deepcopy(pure_head_down)
+    shaky[23].x = 0.20
+    shaky[24].x = 0.32
+    bad_score, bad_head, bad_body = _rule_chain(shaky)
     assert bad_head == "明显低头", "应判定明显低头，实际 %s" % bad_head
     assert bad_body == "明显晃动", "应判定明显晃动，实际 %s" % bad_body
-    assert bad_score <= good_score - 15, "低头+晃动应明显掉分：%s -> %s" % (good_score, bad_score)
+    assert bad_score <= good_score - 5, "明显晃动应扣分：%s -> %s" % (good_score, bad_score)
+    assert bad_score >= good_score - 15, "不应再叠加低头扣分：%s -> %s" % (good_score, bad_score)
 
     invalid_image = base64.b64encode(b"not-a-real-image").decode("utf-8")
     result = MediaPipePoseAnalyzer().analyze(invalid_image, scene="selfstudy", student_id=1)
@@ -384,10 +392,15 @@ def test_sentinel_alert_and_settlement(client, monkeypatch):
     monkeypatch.setattr(room_module, "SENTINEL_COOLDOWN_SEC", 60.0)
 
     def _fake_analyze(image_base64, scene="selfstudy", student_id=None):
-        """恒定返回走神结果（focus_score=None）"""
+        """恒定返回确认走神：显式 is_distracted=True 保留持续走神哨兵语义。
+
+        UNKNOWN 三态裁决后 focus_score=None 不再判走神，故此处显式给出 analyzer 的
+        bool 判定，确保哨兵预警链路（连续走神累计）仍被真实验证。
+        """
         return {
-            "focus_score": None, "action_label": "离开", "annotated_image": "ZmFrZQ==",
+            "focus_score": 30, "action_label": "离开", "annotated_image": "ZmFrZQ==",
             "head_pose": "未检测", "eye_focus": "未检测", "fatigue_level": "未检测",
+            "is_distracted": True,
         }
     monkeypatch.setattr(analyzer_instance, "analyze", _fake_analyze)
 

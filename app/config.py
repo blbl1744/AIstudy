@@ -195,6 +195,14 @@ STRIKE_SECONDS = float(os.getenv("AI_STUDY_STRIKE_SECONDS", "10"))
 # 默认关闭：语音合成依赖可选的 edge_tts 包与外网；关闭时对话仅输出文本短句块。
 TTS_ENABLED = (os.getenv("AI_STUDY_TTS_ENABLED") or "0").strip()
 
+# ===== 姿态诊断日志（第二阶段真实摄像头验证机制）=====
+# 默认关闭：仅当显式置 1 时 analyzer 才逐帧记录到日志；关闭时零副作用、不影响评分与惩罚。
+# 三处一致：app/config.py、.env.example、README.md「环境变量配置表」。
+DIAGNOSTICS_ENABLED = (os.getenv("AI_STUDY_DIAGNOSTICS_ENABLED") or "0").strip() == "1"
+DIAGNOSTICS_FORMAT = (os.getenv("AI_STUDY_DIAGNOSTICS_FORMAT") or "jsonl").strip().lower()
+# 日志目录默认落在项目 logs/diagnostics，可用环境变量覆盖；只写结构化字段，不写原始图像/敏感信息。
+DIAGNOSTICS_DIR = (os.getenv("AI_STUDY_DIAGNOSTICS_DIR") or os.path.join(LOG_DIR, "diagnostics")).strip()
+
 
 # ========== P1-8：配置归一化（唯一真源原则） ==========
 # 说明：旧的四个标量配置项与 POSE_THRESHOLDS 存在语义重叠，这里统一以标量配置为准回灌到阈值字典，

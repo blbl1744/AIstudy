@@ -28,6 +28,7 @@ from .config import (
     WARNING_LEVELS,
     logger,
 )
+from .diagnostics import build_decision_reason, diagnostics
 from .model_loader import (
     FEATURE_DIM,
     MODEL_MIN_CONFIDENCE,
@@ -149,6 +150,17 @@ class MediaPipePoseAnalyzer:
         self.eyes_closed_threshold = EYE_CLOSED_FRAMES   # P1-8：接入配置项（默认 60 帧 ≈ 2 秒 @30fps）
         self.confirmed_eyes_closed = False
 
+        # ===== 注意力状态判定（头部姿态与「走神」解耦）=====
+        # 背景：历史实现把「低头」直接当作走神/扣分信号，导致低头看书、写作业被误判。
+        # 现改为：头部姿态仅作姿态描述，真正走神须经多独立信号综合 + 时间稳定判定。
+        # 这些字段是内部状态，不进入 13 维模型特征，也不改变 WS 广播结构。
+        self.attention_state = "UNKNOWN"       # 防抖后的注意力状态枚举
+        self.is_distracted = False             # 防抖后的「真正走神」信号
+        self._attention_state_candidate = None
+        self._attention_candidate_frames = 0
+        self._distraction_candidate = None
+        self._distraction_candidate_frames = 0
+
         self.check_model_status()
 
     def check_model_status(self):
@@ -252,6 +264,21 @@ class MediaPipePoseAnalyzer:
             # 姿态稳定性（辅助指标）
             pose_stability = self._calculate_pose_stability(head_tilt, shoulder_level)
 
+            # ===== 注意力状态判定：头部姿态与「走神」解耦（本次迭代核心）=====
+            # 头部姿态（低头/转头）只是姿态描述，不再直接触发走神或扣分。
+            # 真正走神须经「多独立信号综合 + 时间稳定」判定，见 _classify_attention_state / _is_true_distraction。
+            attention_state_raw = self._classify_attention_state(
+                head_pose_status, fatigue_status, eye_focus_status,
+                pose_detected=True, confirmed_eyes_closed=self.confirmed_eyes_closed,
+            )
+            attention_state = self._debounce_attention(attention_state_raw)
+            true_distracted_raw = self._is_true_distraction(
+                attention_state, head_pose_status, fatigue_status,
+                eye_focus_status, body_stability_status,
+                confirmed_eyes_closed=self.confirmed_eyes_closed,
+            )
+            is_distracted = self._debounce_distraction(true_distracted_raw)
+
             # ========== P1-4：透明双轨输出（规则分独立可解释，模型结论单独呈现） ==========
             # 规则分永远是最终 focus_score 的唯一来源，模型只作为辅助轨道输出，不再做任何权重混合。
             rule_score = self._calculate_focus_score(head_pose_status, body_stability_status, fatigue_status, eye_focus_status, scene, pose_stability)
@@ -280,7 +307,8 @@ class MediaPipePoseAnalyzer:
             # ========== 保存有效分数（供fallback使用）==========
             self.last_valid_score = focus_score
 
-            is_distracted = focus_score < POSE_THRESHOLDS["distraction_score_threshold"]
+            # 走神累计改用「多信号综合 + 防抖」得到的 is_distracted，
+            # 不再用 focus_score < 60 单一阈值——低头学习时分数波动不应累计走神。
             if is_distracted:
                 self.consecutive_low_focus += 1
                 if self.consecutive_low_focus >= POSE_THRESHOLDS.get("consecutive_low_focus", 3):
@@ -306,6 +334,32 @@ class MediaPipePoseAnalyzer:
                 model_info = (f"模型预测: {model_meta.get('label', '未知')} "
                               f"(专注概率: {model_meta.get('prob_focused', 0.0):.0%}, 置信度: {model_meta.get('confidence', 0.0):.0%})")
 
+            # ===== 诊断埋点（默认关闭；仅观测已计算值，不改变评分/走神累计/惩罚/广播）=====
+            diagnostics.log_frame({
+                "attention_state": attention_state,
+                "is_distracted": is_distracted,
+                "rule_score": rule_score,
+                "focus_score": focus_score,
+                "distraction_count": self.total_distractions,
+                "head_pose_status": head_pose_status,
+                "head_tilt": head_tilt,
+                "head_drop": head_drop,
+                "fatigue_status": fatigue_status,
+                "eye_focus_status": eye_focus_status,
+                "ear_value": locals().get("ear_value"),
+                "confirmed_eyes_closed": self.confirmed_eyes_closed,
+                "body_stability_status": body_stability_status,
+                "body_sway": body_sway,
+                "shoulder_level": shoulder_level,
+                "pose_stability": pose_stability,
+                "pose_detected": True,
+                "face_detected": bool(face_results.multi_face_landmarks),
+                "decision_reason": build_decision_reason(
+                    attention_state, fatigue_status, eye_focus_status,
+                    body_stability_status, self.confirmed_eyes_closed, is_distracted,
+                ),
+            })
+
             return {
                 "focus_score": focus_score,
                 "action_label": action_label,
@@ -314,6 +368,9 @@ class MediaPipePoseAnalyzer:
                 "body_stability": body_stability_status,
                 "fatigue_level": fatigue_status,
                 "eye_focus": eye_focus_status,
+                # ===== 新增：注意力状态判定结果（供房间网关做走神判定；不进入 WS 广播结构）=====
+                "attention_state": attention_state,
+                "is_distracted": is_distracted,
                 "suggestion": suggestion,
                 "pose_detected": True,
                 "annotated_image": annotated_b64,
@@ -577,6 +634,72 @@ class MediaPipePoseAnalyzer:
         most_common = Counter(recent).most_common(1)[0]
         return most_common[0]
 
+    # ========== 注意力状态判定（头部姿态与走神解耦）==========
+    def _classify_attention_state(self, head_pose, fatigue, eye_focus,
+                                  pose_detected, confirmed_eyes_closed):
+        """把多信号归一为稳定的注意力状态枚举（内部使用，不进入 13 维模型特征）。
+
+        枚举：NORMAL / HEAD_DOWN / HEAD_TURNED / FATIGUE / UNKNOWN
+        - 关键点缺失：UNKNOWN（中性，既不判走神也不认定学习）。
+        - 确认闭眼：FATIGUE（疲劳独立通道，允许在低头姿态下触发，见第六阶段测试）。
+        - 低头姿态：HEAD_DOWN（正常学习姿势，绝不据此判走神）。
+        - 转头姿态：HEAD_TURNED（仅姿态描述，是否走神交给多信号综合）。
+        - 其余：NORMAL。
+        注：单纯「低头」不判 FATIGUE；只有可靠闭眼信号才升级为 FATIGUE。
+        """
+        if not pose_detected:
+            return "UNKNOWN"
+        if confirmed_eyes_closed:
+            return "FATIGUE"
+        if head_pose in ("明显低头", "轻微低头"):
+            return "HEAD_DOWN"
+        if head_pose in ("明显偏移", "轻微偏移"):
+            return "HEAD_TURNED"
+        return "NORMAL"
+
+    def _is_true_distraction(self, attention_state, head_pose, fatigue, eye_focus,
+                             body_stability_status, confirmed_eyes_closed):
+        """多独立信号综合判定「真正走神」。
+
+        设计原则：
+        - UNKNOWN / NORMAL / HEAD_DOWN 一律不判走神（正常低头学习永不误判）。
+        - FATIGUE：仅当确认闭眼（可靠信号）才判走神；单纯疲劳等级不直接判。
+        - HEAD_TURNED：转头只是姿态，须叠加「视线明显偏离」或「身体明显晃动」这类
+          独立信号才判走神，避免把非正面姿态一律当异常。
+        """
+        if attention_state in ("UNKNOWN", "NORMAL", "HEAD_DOWN"):
+            return False
+        if attention_state == "FATIGUE":
+            return bool(confirmed_eyes_closed)
+        # HEAD_TURNED：需至少一个独立注意力信号佐证
+        gaze_away = eye_focus in ("频繁偏离", "闭眼/走神")
+        body_unstable = body_stability_status == "明显晃动"
+        return gaze_away or body_unstable
+
+    def _debounce_attention(self, raw_state):
+        """注意力状态防抖：新状态须连续 N 帧一致才切换，避免单帧姿态抖动造成跳变。"""
+        confirm = max(1, int(POSE_THRESHOLDS.get("consecutive_low_focus", 3)))
+        if raw_state == self._attention_state_candidate:
+            self._attention_candidate_frames += 1
+        else:
+            self._attention_state_candidate = raw_state
+            self._attention_candidate_frames = 1
+        if self._attention_candidate_frames >= confirm:
+            self.attention_state = raw_state
+        return self.attention_state
+
+    def _debounce_distraction(self, raw_flag):
+        """走神信号防抖：须连续 N 帧一致才翻转，进入/退出异常均保持稳定，防止抖动脉冲。"""
+        confirm = max(1, int(POSE_THRESHOLDS.get("consecutive_low_focus", 3)))
+        if raw_flag == self._distraction_candidate:
+            self._distraction_candidate_frames += 1
+        else:
+            self._distraction_candidate = raw_flag
+            self._distraction_candidate_frames = 1
+        if self._distraction_candidate_frames >= confirm:
+            self.is_distracted = raw_flag
+        return self.is_distracted
+
     # ========== 评分算法 ==========
     def _calculate_focus_score(self, hp, bs, fat, ef, scene, stability=1.0):
         """规则引擎评分（可解释、可单测）：所有扣分/加分均取自 SCORE_PENALTIES
@@ -588,8 +711,9 @@ class MediaPipePoseAnalyzer:
         s = 100
         if hp == "明显偏移": s -= p["head_pose_major"]
         elif hp == "轻微偏移": s -= p["head_pose_minor"]
-        elif hp == "明显低头": s -= p["head_down_major"]
-        elif hp == "轻微低头": s -= p["head_down_minor"]
+        # 本次迭代：低头（HEAD_DOWN）属正常学习姿态，不再扣分。
+        # 原逻辑「明显低头 -head_down_major / 轻微低头 -head_down_minor」已移除，
+        # 低头只作为姿态描述输出，不参与专注分扣减，也不进入走神累计。
         if bs == "明显晃动": s -= p["body_major"]
         elif bs == "轻微晃动": s -= p["body_minor"]
         if fat == "明显疲劳": s -= p["fatigue_major"]
@@ -624,11 +748,27 @@ class MediaPipePoseAnalyzer:
 
     def _fallback_analysis(self, scene, image_base64=None):
         """无人脸时：不返回虚假专注度，携带原始画面以便前端显示摄像头"""
+        # ===== 诊断埋点（默认关闭；兜底帧记为 UNKNOWN 中性，不判走神不扣分）=====
+        diagnostics.log_frame({
+            "attention_state": "UNKNOWN",
+            "is_distracted": False,
+            "rule_score": None,
+            "focus_score": None,
+            "distraction_count": self.total_distractions,
+            "head_pose_status": "未检测到",
+            "fatigue_status": "未知",
+            "eye_focus_status": "未知",
+            "pose_detected": False,
+            "face_detected": False,
+            "decision_reason": "关键点缺失，中性兜底（UNKNOWN，不判走神不扣分）",
+        })
         return {
             "focus_score": None,
             "distraction_count": self.total_distractions,
             "head_pose": "未检测到", "body_stability": "未检测到",
             "fatigue_level": "未知", "eye_focus": "未知",
+            # 与正常路径一致：关键点缺失 → UNKNOWN 中性，不判走神、不扣分。
+            "attention_state": "UNKNOWN", "is_distracted": False,
             "suggestion": "未检测到人体，请确保摄像头能拍摄到上半身",
             "pose_detected": False,
             "annotated_image": image_base64,
