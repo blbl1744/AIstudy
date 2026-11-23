@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
+from .. import punishment as punishment_module
 from .. import state
 from ..ai_commander import stream_commander_dialogue
 from ..analyzer import analyzer
@@ -202,6 +203,9 @@ async def create_room(request: CreateRoomRequest, user: dict = Depends(get_curre
         "punishment_type": "",                 # evaluate_strike 回写的惩罚类型（供其读取）
         "last_frame_ts": None,
         "last_frame_b64": None,
+        # 独立的“画面到达”时间戳：专供快照新鲜度/过期识别，不复用 last_frame_ts
+        # （后者被推理帧间隔与哨兵走神累计依赖，属冻结逻辑不可扰动）
+        "last_frame_received_ts": None,
         "score_history": [],
         "watchers": {},
         # 房主在线标记：暂离时置 False 仅保留房间，结算时才真正销毁
@@ -262,7 +266,16 @@ async def snapshot(room_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="画面数据无效")
     if not content:
         raise HTTPException(status_code=404, detail="暂无画面")
-    return Response(content=content, media_type="image/jpeg")
+    # 回传画面到达时间戳（供观看端识别“房主已停推/快照过期”），并禁用缓存
+    # 无画面时 last_frame_received_ts 为 None，回 0 表示从未发布
+    frame_ts = room.get("last_frame_received_ts")
+    if frame_ts is None:
+        frame_ts = room.get("last_frame_ts") or 0
+    return Response(
+        content=content,
+        media_type="image/jpeg",
+        headers={"X-Frame-Ts": str(frame_ts), "Cache-Control": "no-store"},
+    )
 
 
 # ========== REST：房间元信息（督学官进入校验归属） ==========
@@ -465,6 +478,9 @@ async def _on_frame_done(room_id: str, user_id: int, image_b64: str, result) -> 
         "annotated_image": payload.get("annotated_image"),
         "strikes_left": room.get("strikes_left", 3),
         "distracted_streak_sec": round(streak_sec, 2),
+        # 第六阶段：下发惩罚引擎实际阈值（可被环境变量/测试覆盖），
+        # 前端进度条据此换算，杜绝硬编码 10 秒导致的前后端阈值漂移。
+        "strike_seconds": float(punishment_module.STRIKE_SECONDS),
     })
 
     # 3.5) 惩罚联动：按引擎事件累加真实扣血次数并广播战术纠偏/惩罚消息
@@ -554,6 +570,129 @@ def _settle_session(room: dict, user_id: int, duration_minutes: int,
     }
 
 
+# ========== 第三阶段：结束链路 ACK / 幂等 / 清理辅助 ==========
+# 结算状态码（写入 session_finish_ack.status，前端据此给出明确反馈）
+SETTLE_OK = "success"            # 本次真正完成结算
+SETTLE_DUPLICATE = "duplicate"   # 已完成，重复请求命中幂等缓存（不重复扣分/保存/广播）
+SETTLE_IN_PROGRESS = "in_progress"  # 并发：别的请求正在结算，等待其完成
+SETTLE_DB_FAILED = "db_failed"   # 数据库保存失败（事务已回滚，可重试）
+SETTLE_FORBIDDEN = "forbidden"   # 无权：仅房主可结束整房
+SETTLE_NOT_FOUND = "not_found"   # 房间不存在（含重复点击/旧请求命中已销毁房间）
+SETTLE_INTERNAL = "internal_error"  # 后端内部异常
+
+
+async def _send_finish_ack(room_id: str, user_id: int, status: str,
+                           message: str = "", result: dict | None = None,
+                           request_id=None) -> None:
+    """向发起结束请求的用户单播结算回执（ACK）。
+
+    status 语义与 SETTLE_* 常量一致；result 仅在 success/duplicate 时携带战报。
+    request_id 原样回传，便于前端把回执与某次点击关联（旧客户端忽略该字段即可，兼容）。
+    ACK 发送失败只记日志，不影响结算主流程（结算状态已由 settlement_records 定案）。
+    """
+    payload = {
+        "type": "session_finish_ack",
+        "status": status,
+        "message": message,
+        "request_id": request_id,
+        "room_id": room_id,
+    }
+    if result is not None:
+        payload["result"] = result
+    try:
+        await _send_to(room_id, user_id, payload)
+    except Exception:
+        logger.exception("结算 ACK 发送失败（room=%s user=%s）", room_id, user_id)
+
+
+def _cleanup_finished_room(room_id: str, room: dict) -> bool:
+    """幂等清理房间全部资源：仅当 active_rooms 中仍是目标房间对象时才销毁，返回是否实际清理。
+
+    身份守卫确保：并发/重复/旧请求不会误清新房间；重复调用安全（第二次返回 False）。
+    """
+    if state.active_rooms.get(room_id) is not room:
+        return False
+    state.active_rooms.pop(room_id, None)
+    with state.room_connections_lock:
+        state.room_connections.pop(room_id, None)
+    host_id = room.get("host_id")
+    if host_id is not None:
+        state._inflight_students.discard(host_id)
+    # 锁随房间销毁一并回收，避免长期驻留（新请求若再来会按需新建）
+    state.purge_settlement_lock(room_id)
+    return True
+
+
+def _build_settle_result(duration_minutes: int, avg_score, settled: dict) -> dict:
+    """组装战报结果（与既有 session_finished 字段保持一致）"""
+    return {
+        "duration_minutes": duration_minutes,
+        "avg_score": avg_score,
+        "total_focus_minutes": settled.get("total_focus_minutes", 0),
+        "rank_title": settled.get("rank_title", ""),
+        "streak_clean_sessions": settled.get("streak_clean_sessions", 0),
+        "shield_count": settled.get("shield_count", 0),
+    }
+
+
+async def _settle_room_once(room_id: str, room: dict, user_id: int,
+                            request_id=None, broadcast: bool = True) -> dict:
+    """幂等结算核心：同一房间只实际结算一次，返回统一结构的结果描述。
+
+    返回 dict: {"status": SETTLE_*, "message": str, "result": dict|None}
+    并发控制：per-room asyncio.Lock 内完成「查记录→写库→落定状态」，只有一个协程真正写库；
+    数据保护：DB 事务（get_db 上下文）保证写库异常整体回滚，失败状态可安全重试不产生重复行；
+    幂等命中：status=done 直接返回缓存战报，不重复扣分/保存/广播（只有 broadcast 分支首次广播）。
+    """
+    lock = state.get_settlement_lock(room_id)
+    async with lock:
+        cached = state.settlement_records.get(room_id)
+        if cached and cached.get("status") == SETTLE_OK:
+            # 已完成：直接回放既有战报，绝不重复结算
+            logger.info("结算幂等命中：房间 %s 已完成，跳过重复结算（request_id=%s）", room_id, request_id)
+            return {"status": SETTLE_DUPLICATE,
+                    "message": "本局已结算，已返回原有战报",
+                    "result": cached.get("result")}
+
+        # 计算本局指标（在锁内基于房间对象快照，避免并发修改）
+        now = _now_ts()
+        created = float(room.get("created_at") or now)
+        duration_minutes = int(max(0.0, now - created) // 60)
+        scores = [s for s in (room.get("score_history") or [])
+                  if isinstance(s, (int, float)) and not isinstance(s, bool)]
+        avg_score = round(sum(scores) / len(scores)) if scores else None
+        strikes_used = int(room.get("strikes_used", 0) or 0)
+
+        # 标记结算中：并发的其它协程若也进到锁，会在上面命中 settling 之外的路径
+        state.settlement_records.set(room_id, {
+            "status": SETTLE_IN_PROGRESS, "request_id": request_id,
+        })
+        try:
+            settled = _settle_session(room, user_id, duration_minutes, avg_score, strikes_used)
+        except Exception as exc:
+            # 事务已回滚；落 failed 状态允许后续重试，不残留半成品数据
+            state.settlement_records.set(room_id, {
+                "status": SETTLE_DB_FAILED, "request_id": request_id, "error": str(exc),
+            })
+            logger.exception("房间 %s 结算写库失败（request_id=%s）", room_id, request_id)
+            return {"status": SETTLE_DB_FAILED,
+                    "message": "结算保存失败，请稍后重试（本局未重复扣分）",
+                    "result": None}
+
+        result = _build_settle_result(duration_minutes, avg_score, settled)
+        state.settlement_records.set(room_id, {
+            "status": SETTLE_OK, "request_id": request_id, "result": result,
+        })
+
+    # 锁外广播：仅首次真正结算时通知全体；重复请求不会走到这里（上面已 return duplicate）
+    if broadcast:
+        try:
+            await _broadcast(room_id, {"type": "session_finished", **result})
+        except Exception:
+            logger.exception("session_finished 广播失败（room=%s），结算已完成不受影响", room_id)
+    return {"status": SETTLE_OK, "message": "结算成功", "result": result}
+
+
 # ========== 统一房间 WebSocket 网关 ==========
 @router.websocket("/ws/room/{room_id}")
 async def room_ws(websocket: WebSocket, room_id: str):
@@ -602,6 +741,12 @@ async def room_ws(websocket: WebSocket, room_id: str):
     if is_host:
         # 房主连入即视为在线（暂离重连会由此恢复在线标记）
         room["host_online"] = True
+        # 下发当前发布态：房主刷新/重连后以服务端现场校准，不凭本地假设“已发布”
+        await _send_to(room_id, user_id, {
+            "type": "stream_status",
+            "published": bool(room.get("last_frame_b64")),
+            "ts": room.get("last_frame_received_ts"),
+        })
         # 分流：已开过局（有历史对话或已发过开局播报）认定为暂离重连，恢复现场而非重复开局
         has_history = bool(room.get("dialogue_history"))
         if room.get("_proactive_sent") or has_history:
@@ -633,20 +778,69 @@ async def room_ws(websocket: WebSocket, room_id: str):
                 continue
             mtype = msg.get("type")
             try:
+                # ===== 房间公共互动消息（房主与督学官均可发；身份取 JWT，绝不信任客户端伪造字段） =====
+                # 第五阶段修复⑦：弹幕/音效此前仅在督学官分支处理，房主发出的消息被静默丢弃，
+                # 造成双向通信不完整。此处提升为房间级公共消息，并附带服务端生成或原样回传的
+                # message_id，供所有端幂等去重（本地回显与广播、重连、重复投递均不重复展示）。
+                if mtype in ("barrage", "sound_effect"):
+                    _raw_mid = msg.get("message_id")
+                    if isinstance(_raw_mid, (str, int)) and str(_raw_mid).strip():
+                        message_id = str(_raw_mid).strip()[:128]
+                    else:
+                        message_id = str(uuid.uuid4())
+                    if mtype == "barrage":
+                        # 与前端一致的字符清洗：保留换行与可打印字符，strip 后按 1~60 字校验。
+                        text = "".join(
+                            ch for ch in str(msg.get("text", ""))
+                            if ch == "\n" or (ord(ch) >= 32 and ord(ch) != 127)
+                        ).strip()
+                        if 1 <= len(text) <= 60:
+                            # from 恒取 JWT 身份，忽略客户端可能伪造的 sender_id / from；
+                            # 另附 user_id 供前端精确识别发送者，不依赖可重名的昵称。
+                            await _broadcast(room_id, {
+                                "type": "room_interaction", "kind": "barrage",
+                                "from": nickname, "user_id": user_id,
+                                "text": text, "message_id": message_id,
+                            })
+                    else:
+                        sound = msg.get("sound")
+                        if sound in SOUND_WHITELIST:
+                            await _broadcast(room_id, {
+                                "type": "room_interaction", "kind": "sound_effect",
+                                "from": nickname, "user_id": user_id,
+                                "sound": sound, "message_id": message_id,
+                            })
+                    # 公共互动已广播给全房（含发送者本人），不再进入下方角色分支，避免重复处理。
+                    continue
                 if is_host:
                     # ===== 学习者消息 =====
                     if mtype == "frame":
                         image = msg.get("image")
-                        if image:
-                            # 快照画面即时保存：锁房态也更新，保证监督端画面不中断
-                            room["last_frame_b64"] = image
+                        # 房间身份守卫：房间已结束/重建时，旧连接的迟到帧不得写入新房间
+                        if state.active_rooms.get(room_id) is not room:
+                            await websocket.send_json({"type": "frame_ack", "ok": False, "reason": "stale_room"})
+                            continue
+                        if not image:
+                            # 空帧不更新画面，明确回执失败：区分“消息发出”与“后端确认写入”
+                            await websocket.send_json({"type": "frame_ack", "ok": False, "reason": "empty_frame"})
+                            continue
+                        # 快照画面即时保存：锁房态也更新，保证监督端画面不中断
+                        room["last_frame_b64"] = image
+                        # 独立的画面到达时间戳，专供快照新鲜度识别；不扰动推理所用的 last_frame_ts
+                        room["last_frame_received_ts"] = _now_ts()
+                        # 只有后端确实写入有效画面才回 ok=True，房主据此从 PUBLISHING 进入 STREAM_PUBLISHED
+                        await websocket.send_json({
+                            "type": "frame_ack",
+                            "ok": True,
+                            "frame_id": msg.get("frame_id"),
+                            "ts": room["last_frame_received_ts"],
+                            "analysis_skipped": user_id in state._inflight_students,
+                        })
                         # 锁房态：仍更新画面，但跳过常规推理，仅下发解锁提示（惩罚提交走独立分支）
                         if room.get("is_locked"):
                             await websocket.send_json({"type": "room_locked", "msg": "请先完成惩罚解锁"})
                             continue
-                        if not image:
-                            continue
-                        # 背压：同一学习者上一帧未算完则丢弃
+                        # 背压：同一学习者上一帧未算完则丢弃（画面已确认写入，仅跳过推理）
                         if user_id in state._inflight_students:
                             await websocket.send_json({"type": "analysis_update", "skipped": True})
                             continue
@@ -701,47 +895,43 @@ async def room_ws(websocket: WebSocket, room_id: str):
                             })
 
                     elif mtype == "finish_session":
-                        now = _now_ts()
-                        created = float(room.get("created_at") or now)
-                        duration_minutes = int(max(0.0, now - created) // 60)
-                        scores = [s for s in (room.get("score_history") or [])
-                                  if isinstance(s, (int, float)) and not isinstance(s, bool)]
-                        avg_score = round(sum(scores) / len(scores)) if scores else None
-                        # 如实取引擎与联动累加的真实扣血次数（护盾抵消也计一次），不用 strikes_left 反推
-                        strikes_used = int(room.get("strikes_used", 0) or 0)
-                        settled = _settle_session(room, user_id, duration_minutes, avg_score, strikes_used)
-                        await _broadcast(room_id, {
-                            "type": "session_finished",
-                            "duration_minutes": duration_minutes,
-                            "avg_score": avg_score,
-                            **settled,
-                        })
-                        # 结算后清理房间与全部连接
-                        state.active_rooms.pop(room_id, None)
-                        with state.room_connections_lock:
-                            state.room_connections.pop(room_id, None)
-                        state._inflight_students.discard(user_id)
-                        break
+                        # 生命周期 A（房主结束整房）与 C（AI 单机结束）共用幂等结算核心：
+                        # 只有 host 能走到此分支；按 room_id 幂等，重复/并发/旧请求只结算一次。
+                        # 生命周期 B（普通学员/房主暂离）走下方 leave_room 分支，保留房间不结算。
+                        req_id = msg.get("request_id")
+                        outcome = await _settle_room_once(
+                            room_id, room, user_id, request_id=req_id, broadcast=True)
+                        status = outcome["status"]
+                        result = outcome.get("result")
+                        if status in (SETTLE_OK, SETTLE_DUPLICATE):
+                            # ACK 必须在清理房间前发送（_send_to 依赖 room_connections）。
+                            # success 首次已由 _settle_room_once 广播 session_finished；
+                            # duplicate 仅回放战报，不重复广播、不重复扣分。
+                            await _send_finish_ack(
+                                room_id, user_id, status, outcome["message"],
+                                result=result, request_id=req_id)
+                            _cleanup_finished_room(room_id, room)
+                            break
+                        elif status == SETTLE_DB_FAILED:
+                            # 事务已回滚，明确告知失败，保留房间与连接允许前端重试
+                            await _send_finish_ack(
+                                room_id, user_id, SETTLE_DB_FAILED, outcome["message"],
+                                request_id=req_id)
+                        else:
+                            await _send_finish_ack(
+                                room_id, user_id, SETTLE_INTERNAL,
+                                "结算发生内部异常，请稍后重试", request_id=req_id)
 
                     elif mtype == "leave_room":
                         # 房主暂时离席：跳出循环，由 finally 标记离线并广播 host_status（房间保留）
                         break
                 else:
-                    # ===== 督学官消息 =====
-                    if mtype == "barrage":
-                        text = str(msg.get("text", "")).strip()
-                        if 1 <= len(text) <= 60:
-                            await _broadcast(room_id, {
-                                "type": "room_interaction", "kind": "barrage",
-                                "from": nickname, "text": text,
-                            })
-                    elif mtype == "sound_effect":
-                        sound = msg.get("sound")
-                        if sound in SOUND_WHITELIST:
-                            await _broadcast(room_id, {
-                                "type": "room_interaction", "kind": "sound_effect",
-                                "from": nickname, "sound": sound,
-                            })
+                    # ===== 督学官消息（barrage/sound_effect 已在公共互动分支统一处理） =====
+                    if mtype == "finish_session":
+                        # 督学官无权结束整房：明确回执 forbidden，避免前端无限等待
+                        await _send_finish_ack(
+                            room_id, user_id, SETTLE_FORBIDDEN,
+                            "只有房主可以结束本局", request_id=msg.get("request_id"))
             except Exception as exc:
                 logger.exception(
                     "房间 %s 单条消息处理异常，已隔离避免断连（用户 %s）：%s",
@@ -755,6 +945,7 @@ async def room_ws(websocket: WebSocket, room_id: str):
                 # 暂离路径：仅标记房主离线、清空画面缓存，房间与场景/惩罚/对话等现场完整保留
                 room["host_online"] = False
                 room["last_frame_b64"] = None
+                room["last_frame_received_ts"] = None  # 画面已清空，时间戳同步归零供观看端识别
                 # 向仍在线的督学官广播房主暂离（不主动断开督学官连接，待房主返回恢复）
                 if room.get("watchers"):
                     await _broadcast(room_id, {
@@ -763,16 +954,21 @@ async def room_ws(websocket: WebSocket, room_id: str):
                         "msg": "房主暂时离开，稍后回来",
                     }, exclude_user_id=user_id)
             # 仅从连接表移除房主自身连接，保留房间与督学官连接供重连恢复
+            # 身份守卫：同用户重连会覆盖 room_connections[room_id][user_id]，
+            # 旧连接延迟断开时映射里已是新 ws，不得误删新连接（问题②旧连接不污染新连接）
             with state.room_connections_lock:
                 conns = state.room_connections.get(room_id, {})
-                conns.pop(user_id, None)
+                if conns.get(user_id) is websocket:
+                    conns.pop(user_id, None)
                 if not conns:
                     state.room_connections.pop(room_id, None)
         else:
             # 督学官断开：移除连接与 watcher 记录，同步通知房主最新名单
+            # 同样加身份守卫，避免旧督学官连接延迟断开误删重连后的新连接
             with state.room_connections_lock:
                 conns = state.room_connections.get(room_id, {})
-                conns.pop(user_id, None)
+                if conns.get(user_id) is websocket:
+                    conns.pop(user_id, None)
                 if not conns:
                     state.room_connections.pop(room_id, None)
             (room.get("watchers") or {}).pop(user_id, None)

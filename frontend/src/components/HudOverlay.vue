@@ -2,12 +2,12 @@
 /**
  * 沉浸式 HUD 覆盖层：三次机会生命值、实时专注评分、走神进度、专注计时、
  * 在线督学官角标，以及房间互动弹幕飘过与程序化互动音效。
- * 所有数据来自 roomStore；弹幕与音效在组件层直接订阅 socket，避免快捷广播被状态覆盖丢失。
+ * 弹幕与音效统一从 roomStore 的有界去重缓存按游标消费：即便组件晚挂载或 WS 重连，
+ * 缓存中的消息也不会丢失，且按 message_id 幂等不重复渲染。
  * 全程零外部资源，音效由 Web Audio API 实时合成。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoomStore } from '@/stores/room'
-import type { RoomSocket } from '@/api/roomSocket'
 import type { SoundEffect } from '@/types'
 
 const room = useRoomStore()
@@ -31,8 +31,13 @@ watch(
 
 // ===== 二、专注评分与走神进度 =====
 const scoreText = computed(() => room.focusScore === null ? '--' : String(Math.round(room.focusScore)))
-// 走神判定阈值 10 秒，与后端防误判缓冲一致；进度封顶 100%
-const distractedPercent = computed(() => Math.min(100, Math.round((room.distractedStreakSec / 10) * 100)))
+// 阈值取后端惩罚引擎权威下发值（room.strikeSeconds），前端不再硬编码业务阈值；
+// 这里只做「累计秒数 / 阈值」的展示换算，是否走神/是否扣血完全由后端裁决。
+const distractedPercent = computed(() => {
+  const threshold = Math.max(1, room.strikeSeconds || 10)
+  const pct = Math.round((room.distractedStreakSec / threshold) * 100)
+  return Math.min(100, Math.max(0, pct))
+})
 
 // ===== 三、本局专注计时器 =====
 const elapsedSeconds = ref(0)
@@ -144,23 +149,18 @@ function playSound(sound: string): void {
   }
 }
 
-// socket 可能晚于组件挂载创建，故监听其变化来绑定互动订阅
-let unsubscribers: Array<() => void> = []
+// 从 store 去重缓存按游标消费互动：晚挂载/重连都不丢、不重。
+// noteInteraction 已在 store 层按 message_id 去重，这里仅负责把新增项渲染成飘过弹幕/音效。
 watch(
-  () => room.socket,
-  (ws: RoomSocket | null) => {
-    unsubscribers.forEach((u) => u())
-    unsubscribers = []
-    if (!ws) return
-    unsubscribers.push(
-      ws.on('room_interaction', (msg) => {
-        if (msg.kind === 'barrage' && msg.text) {
-          pushBarrage(msg.text)
-        } else if (msg.kind === 'sound_effect' && msg.sound) {
-          playSound(msg.sound as SoundEffect)
-        }
-      }),
-    )
+  () => room.interactionHeadSeq,
+  () => {
+    for (const item of room.drainHudInteractions()) {
+      if (item.kind === 'barrage' && item.text) {
+        pushBarrage(item.text)
+      } else if (item.kind === 'sound_effect' && item.sound) {
+        playSound(item.sound as SoundEffect)
+      }
+    }
   },
   { immediate: true },
 )
@@ -172,7 +172,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (clockTimer !== null) window.clearInterval(clockTimer)
   if (shakeTimer !== null) window.clearTimeout(shakeTimer)
-  unsubscribers.forEach((u) => u())
   if (audioCtx) {
     void audioCtx.close()
     audioCtx = null
@@ -224,8 +223,13 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .hud {
-  position: absolute;
-  inset: 0;
+  /* 状态条参与正常文档流，随内容动态换行占位，不再用全屏绝对定位与房间信息框抢层叠 */
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
   pointer-events: none;
   z-index: 5;
   color: var(--scene-primary, #00e5ff);
@@ -251,19 +255,20 @@ onBeforeUnmount(() => {
   border: 1px solid var(--scene-primary, #00e5ff);
   border-radius: 3px;
   font-size: 13px;
-  white-space: nowrap;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* 顶部信息条：流式 flex 排布，各块独立占位、自动换行，互不覆盖房间信息框 */
 .hud-topbar {
-  position: absolute;
-  top: 8px;
-  left: 14px;
-  right: 14px;
+  /* 顶部信息条：正常流式栅格，各块独立占位、自动换行，宽度按内容动态计算 */
+  position: relative;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px 12px;
+  min-width: 0;
   pointer-events: none;
 }
 .hud-label {
@@ -297,10 +302,12 @@ onBeforeUnmount(() => {
 }
 
 .hud-distract {
-  min-width: 200px;
+  flex: 1 1 200px;
+  min-width: 160px;
 }
 .hud-bar {
-  flex: 1 1 120px;
+  flex: 1 1 100px;
+  min-width: 60px;
   height: 6px;
   background: rgba(255, 255, 255, 0.15);
   border-radius: 3px;
@@ -313,12 +320,15 @@ onBeforeUnmount(() => {
 }
 
 .hud-barrage-layer {
-  position: absolute;
-  top: 30%;
+  /* 弹幕层独立覆盖视口中部，与顶部信息条解耦，避免抢位遮挡 */
+  position: fixed;
   left: 0;
-  width: 100%;
+  right: 0;
+  top: 30%;
   height: 160px;
   overflow: hidden;
+  pointer-events: none;
+  z-index: 5;
 }
 .hud-barrage {
   position: absolute;

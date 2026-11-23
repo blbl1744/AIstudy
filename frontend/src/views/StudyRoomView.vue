@@ -13,6 +13,7 @@ import { getToken, roomApi } from '@/api/http'
 import { useUserStore } from '@/stores/user'
 import { useRoomStore } from '@/stores/room'
 import { useSceneStore } from '@/stores/scene'
+import type { PublishStreamState } from '@/types'
 import SceneRenderer from '@/components/SceneRenderer.vue'
 import HudOverlay from '@/components/HudOverlay.vue'
 import CommanderChat from '@/components/CommanderChat.vue'
@@ -45,13 +46,20 @@ const goalText = computed(() =>
 )
 const sceneTitle = computed(() => sceneStore.activeScene?.scene_title ?? '督学战场')
 
+// 实例代次令牌：切房间/卸载后，旧的异步回调不得把旧房数据写进新房 Pinia
+let instanceToken = 0
+
 /**
  * 挂载时拉取房间现场元信息：恢复目标、剩余机会、锁房、惩罚与场景配置。
  * 房间已被结算/回收（404）时保留空态，交由连接失败提示处理，不阻塞渲染。
  */
 async function restoreFromMeta(): Promise<void> {
+  const token = instanceToken
+  const roomId = currentRoomId.value
   try {
-    const meta = await roomApi.meta(currentRoomId.value)
+    const meta = await roomApi.meta(roomId)
+    // 仅当本实例仍活跃、房间号未变时才允许写入，避免延迟响应污染其它房间
+    if (token !== instanceToken || roomId !== currentRoomId.value) return
     roomStore.applyRoomMeta(meta)
     if (meta.scene_config) sceneStore.setActiveScene(meta.scene_config)
   } catch {
@@ -60,6 +68,7 @@ async function restoreFromMeta(): Promise<void> {
 }
 
 async function ensureScene(): Promise<void> {
+  const token = instanceToken
   if (sceneStore.activeScene) return
   const fromDetail = roomStore.roomDetail?.scene_config
   if (fromDetail) {
@@ -68,6 +77,8 @@ async function ensureScene(): Promise<void> {
   }
   try {
     const presets = await sceneStore.loadPresets()
+    // 场景加载完成后再次校验实例活跃，避免切房后覆盖新场景
+    if (token !== instanceToken) return
     if (presets.length > 0) sceneStore.setActiveScene(presets[0])
   } catch {
     // 场景加载失败时保留空态，模板显示加载提示，不阻塞房间连接
@@ -78,31 +89,67 @@ async function ensureScene(): Promise<void> {
 const consentChecked = ref(false) // 知情同意勾选，未勾选禁用开启按钮
 const cameraOn = ref(false)
 const cameraError = ref('')
+// 发布态状态机：本地开启不等于远端成功，成功态只由后端 frame_ack 驱动
+const publishState = ref<PublishStreamState>('CAMERA_CLOSED')
 const videoEl = ref<HTMLVideoElement | null>(null)
 let cameraStream: MediaStream | null = null
 let offscreenCanvas: HTMLCanvasElement | null = null
 let frameTimer: number | null = null
+let frameSeq = 0                 // 单调递增帧序号，随 frame 上行、由 frame_ack 原样回传
+let ackFrameId = -1              // 最近一次被后端确认的帧序号，用于判定是否已真正发布
+let consecutiveSendFail = 0      // 连续发送失败计数（WS 未连接或 send 抛错）
+const MAX_SEND_FAIL = 3          // 连续失败阈值：超过即进入 STREAM_ERROR
 const PUSH_WIDTH = 480
 const JPEG_QUALITY = 0.7
+
+/** 是否处于已发布：须同时满足状态为已发布且确有被后端确认过的帧号 */
+const isStreamPublished = computed(() => publishState.value === 'STREAM_PUBLISHED' && ackFrameId >= 0)
+
+/** 发布态的中文提示，供 UI 明确区分本地就绪与远端确认 */
+const publishStateText = computed(() => {
+  switch (publishState.value) {
+    case 'CAMERA_CLOSED': return '摄像头未开启'
+    case 'CAMERA_OPENING': return '正在开启摄像头…'
+    case 'CAMERA_READY': return '本地就绪，等待发布'
+    case 'PUBLISHING': return '画面发布中，等待确认…'
+    case 'STREAM_PUBLISHED': return '画面已发布，督学官可见'
+    case 'STREAM_ERROR': return cameraError.value || '推流失败，正在重试…'
+    default: return ''
+  }
+})
 
 /** 开启摄像头：显式授权后采集，绑定本地预览并启动 1fps 推流 */
 async function enableCamera(): Promise<void> {
   if (!consentChecked.value || cameraOn.value) return
+  const token = instanceToken
+  const roomId = currentRoomId.value
   cameraError.value = ''
+  publishState.value = 'CAMERA_OPENING'
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+    // 授权回包延迟期间若已切房/卸载，立即释放轨道，杜绝旧房摄像头写入新房
+    if (token !== instanceToken || roomId !== currentRoomId.value) {
+      stream.getTracks().forEach((track) => track.stop())
+      return
+    }
     cameraStream = stream
     cameraOn.value = true
+    publishState.value = 'CAMERA_READY'
     await nextTick()
-    startPush(stream)
+    startPush(stream, token, roomId)
   } catch {
     cameraError.value = '摄像头开启失败，请检查浏览器权限或设备占用情况'
     cameraOn.value = false
+    publishState.value = 'STREAM_ERROR'
   }
 }
 
-/** 按 480px 等比缩放离屏画布，每秒导出一帧 JPEG Base64 并经 WebSocket 上行 */
-function startPush(stream: MediaStream): void {
+/**
+ * 按 480px 等比缩放离屏画布，每秒尝试导出一帧 JPEG 并经 WebSocket 上行。
+ * 关键纪律：定时器只负责“尝试发送”，绝不把 send 成功当作后端已接收；
+ * 成功态仅由 frame_ack(ok=true) 驱动， WS 未连接/发送失败会累积为明确错误态。
+ */
+function startPush(stream: MediaStream, token: number, roomId: string): void {
   const video = videoEl.value
   if (!video) return
   video.srcObject = stream
@@ -118,13 +165,60 @@ function startPush(stream: MediaStream): void {
   offscreenCanvas = canvas
   const ctx = canvas.getContext('2d')
 
-  // 压缩帧写入房间帧缓存队列，UI 关闭后即停止推帧
   frameTimer = window.setInterval(() => {
+    // 切房/卸载后旧定时器不得再为新房产帧
+    if (token !== instanceToken || roomId !== currentRoomId.value) return
+    if (!cameraOn.value) return
     if (!ctx || video.readyState < 2) return
     ctx.drawImage(video, 0, 0, PUSH_WIDTH, targetH)
     const image = canvas.toDataURL('image/jpeg', JPEG_QUALITY)
-    roomStore.send({ type: 'frame', image })
+    const frameId = ++frameSeq
+    // 显式检查 WS 是否 OPEN：未连接不伪造成功，累积失败态，待自动重连后继续尝试
+    if (!roomStore.isSocketConnected() || !roomStore.send({ type: 'frame', image, frame_id: frameId })) {
+      consecutiveSendFail += 1
+      if (consecutiveSendFail >= MAX_SEND_FAIL) {
+        publishState.value = 'STREAM_ERROR'
+        cameraError.value = '连接中断，画面暂停发布，恢复后自动重试'
+      } else if (publishState.value !== 'STREAM_PUBLISHED') {
+        publishState.value = 'CAMERA_READY'
+      }
+      return
+    }
+    consecutiveSendFail = 0
+    cameraError.value = ''
+    // send 成功仅代表消息进入 WS 缓冲，状态停留 PUBLISHING 等待后端确认
+    if (publishState.value !== 'STREAM_PUBLISHED') publishState.value = 'PUBLISHING'
   }, 1000)
+}
+
+/** 处理帧回执：仅 ok=true 才推进到 STREAM_PUBLISHED，失败累积为错误态 */
+function onFrameAck(msg: { ok: boolean; frame_id?: number; reason?: string }): void {
+  if (msg.ok) {
+    if (typeof msg.frame_id === 'number') ackFrameId = msg.frame_id
+    consecutiveSendFail = 0
+    cameraError.value = ''
+    publishState.value = 'STREAM_PUBLISHED'
+  } else {
+    consecutiveSendFail += 1
+    if (consecutiveSendFail >= MAX_SEND_FAIL) {
+      publishState.value = 'STREAM_ERROR'
+      cameraError.value = msg.reason === 'stale_room'
+        ? '房间已变更，画面发布已停止'
+        : '服务端未接收到有效画面，正在重试'
+    }
+  }
+}
+
+/** 处理连入时下发的发布态：以服务端现场校准本地显示，不凭本地假设成功 */
+function onStreamStatus(msg: { published: boolean; ts?: number | null }): void {
+  if (!cameraOn.value) return
+  if (!msg.published) {
+    // 服务端无画面：即便本地已开启也只能停留在等待发布，不能显示已发布
+    if (publishState.value === 'STREAM_PUBLISHED') publishState.value = 'PUBLISHING'
+  } else if (isStreamPublished.value === false) {
+    // 服务端已有画面（如本房先前推过）：确认发布成功
+    publishState.value = 'STREAM_PUBLISHED'
+  }
 }
 
 /** 停止推流并释放摄像头轨道：结束本局、主动退出与组件卸载均调用 */
@@ -140,6 +234,9 @@ function stopCamera(): void {
   if (videoEl.value) videoEl.value.srcObject = null
   offscreenCanvas = null
   cameraOn.value = false
+  publishState.value = 'CAMERA_CLOSED'
+  consecutiveSendFail = 0
+  ackFrameId = -1
 }
 
 // ===== 二·五、房间号与督学链接复制 =====
@@ -202,7 +299,61 @@ interface BattleReport {
 }
 const report = ref<BattleReport | null>(null)
 const finishError = ref('')
+const finishing = ref(false)            // 结算进行中：点击即置位，防止短时间重复点击
+let finishRequestId = ''                // 本次结算请求标识，用于关联 ACK、忽略旧回执
+let finishTimer: number | null = null   // 结算超时兜底，避免"发送成功即无限等待"
+let reportShownForRequest = ''          // 已弹窗的请求标识，避免 ACK 与 session_finished 重复弹窗
 let wsUnsubscribers: Array<() => void> = []
+
+/** 清除结算超时计时器 */
+function clearFinishTimer(): void {
+  if (finishTimer !== null) {
+    window.clearTimeout(finishTimer)
+    finishTimer = null
+  }
+}
+
+/** 统一弹战报（幂等）：同一请求只弹一次，兼容 ACK 与 session_finished 两条通路 */
+function showReport(result: BattleReport, rid: string): void {
+  if (reportShownForRequest === rid) return
+  reportShownForRequest = rid
+  finishing.value = false
+  clearFinishTimer()
+  stopCamera()
+  report.value = result
+}
+
+/** 结算失败：明确原因、恢复可点击状态，不吞异常假装成功 */
+function failFinish(message: string): void {
+  finishing.value = false
+  clearFinishTimer()
+  finishError.value = message || '结算失败，请重试'
+}
+
+/**
+ * 正常结束本局：立即停推（隐私优先），再请求服务端幂等结算。
+ * 点击即 loading + 防重复；成功/失败均有明确反馈；超时兜底不无限等待。
+ * 网络中断/重复点击/旧回执均由服务端按 room_id 幂等兜底，可安全重试。
+ */
+function finishSession(): void {
+  if (finishing.value) return          // 防短时间重复点击
+  stopCamera()
+  finishError.value = ''
+  finishing.value = true
+  finishRequestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  clearFinishTimer()
+  const ok = roomStore.send({ type: 'finish_session', request_id: finishRequestId })
+  if (!ok) {
+    failFinish('连接未就绪，结算请求未发出，请稍后重试')
+    return
+  }
+  // 超时兜底：不把"网络发送成功"当业务成功，也不无限等待
+  finishTimer = window.setTimeout(() => {
+    if (finishing.value) {
+      failFinish('结算响应超时，可能网络中断；请稍后重试（服务端保证只结算一次）')
+    }
+  }, 8000)
+}
 
 /**
  * 暂时返回广场：只停推、断开连接并清空本地房间态，不结算、不销毁房间。
@@ -212,14 +363,6 @@ function backToPlaza(): void {
   stopCamera()
   roomStore.reset()
   router.push('/plaza')
-}
-
-/** 正常结束本局：立即停推（隐私优先），再请求服务端结算，等待 session_finished 弹窗 */
-function finishSession(): void {
-  stopCamera()
-  finishError.value = ''
-  const ok = roomStore.send({ type: 'finish_session' })
-  if (!ok) finishError.value = '连接未就绪，结算请求未发出，请稍后重试'
 }
 
 /** 确认战报：刷新成长档案、清理房间态并返回广场 */
@@ -234,23 +377,66 @@ async function confirmReport(): Promise<void> {
 }
 
 onMounted(() => {
+  // 每次挂载递增令牌：旧实例的异步回调（restoreFromMeta/ensureScene）持有旧 token 将被丢弃
+  instanceToken += 1
+  const token = instanceToken
+  const mountedRoomId = currentRoomId.value
+  // sceneStore 为全局单例：先清空上间房的场景，避免旧房场景残留到新房渲染
+  sceneStore.resetScene()
   // 先恢复现场（目标/场景/惩罚等），再建立连接；连接建立后 room_state_sync 会二次校准
-  void restoreFromMeta().then(() => ensureScene())
-  const ws = roomStore.createSocket(() => getToken(), currentRoomId.value)
+  void restoreFromMeta().then(() => {
+    if (token === instanceToken && mountedRoomId === currentRoomId.value) void ensureScene()
+  })
+  const ws = roomStore.createSocket(() => getToken(), mountedRoomId)
   // 在连接前订阅：store 内部消费 room_state_sync 恢复进度，此处据其场景配置还原渲染场景
   wsUnsubscribers.push(
+    // 帧回执：唯一能把本地摄像头推进到“已发布”的依据；旧客户端不认识该 type 即忽略
+    ws.on('frame_ack', (msg) => {
+      if (token !== instanceToken || mountedRoomId !== currentRoomId.value) return
+      onFrameAck(msg)
+    }),
+    // 连入发布态：以服务端现场校准本地，刷新/重连后不误判“已发布”
+    ws.on('stream_status', (msg) => {
+      if (token !== instanceToken || mountedRoomId !== currentRoomId.value) return
+      onStreamStatus(msg)
+    }),
+    // ACK：新后端回执，承载终态（成功/重复/失败）；旧客户端不认识该 type，无此订阅即忽略
+    ws.on('session_finish_ack', (msg) => {
+      if (token !== instanceToken || mountedRoomId !== currentRoomId.value) return
+      // 忽略旧请求的迟到回执，避免污染当前会话
+      if (msg.request_id && msg.request_id !== finishRequestId) return
+      const st = msg.status
+      if ((st === 'success' || st === 'duplicate') && msg.result) {
+        showReport({
+          duration_minutes: msg.result.duration_minutes,
+          avg_score: msg.result.avg_score,
+          total_focus_minutes: msg.result.total_focus_minutes,
+          rank_title: msg.result.rank_title,
+          streak_clean_sessions: msg.result.streak_clean_sessions,
+          shield_count: msg.result.shield_count,
+        }, finishRequestId)
+      } else if (st === 'in_progress') {
+        // 并发中：本房另有请求正在结算，继续等待终态 ACK/广播，不误判失败
+        finishError.value = '正在结算中，请稍候…'
+      } else {
+        // db_failed / forbidden / not_found / internal_error：明确原因，停止等待
+        failFinish(msg.message || '结算失败，请重试')
+      }
+    }),
+    // session_finished：兼容旧后端广播，与新 ACK 共用去重键，避免重复弹窗
     ws.on('session_finished', (msg) => {
-      stopCamera()
-      report.value = {
+      if (token !== instanceToken || mountedRoomId !== currentRoomId.value) return
+      showReport({
         duration_minutes: msg.duration_minutes,
         avg_score: msg.avg_score,
         total_focus_minutes: msg.total_focus_minutes,
         rank_title: msg.rank_title,
         streak_clean_sessions: msg.streak_clean_sessions,
         shield_count: msg.shield_count,
-      }
+      }, finishRequestId)
     }),
     ws.on('room_state_sync', (msg) => {
+      if (token !== instanceToken || mountedRoomId !== currentRoomId.value) return
       // 房主重连：以服务端现场为准还原场景（进度与历史对话由 roomStore 恢复）
       if (msg.scene_config) sceneStore.setActiveScene(msg.scene_config)
     }),
@@ -259,6 +445,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  // 先失效本实例所有异步回调，再停推/退订/清状态，杜绝旧房事件回写新房
+  instanceToken += 1
+  clearFinishTimer()
   stopCamera()
   wsUnsubscribers.forEach((u) => u())
   wsUnsubscribers = []
@@ -270,6 +459,8 @@ onBeforeUnmount(() => {
   <div class="study-page">
     <SceneRenderer v-if="sceneForRender" :scene="sceneForRender">
       <div class="study-layout">
+        <!-- HUD 状态条：正常流首行，按内容动态换行，不再覆盖房间信息框 -->
+        <HudOverlay />
         <!-- 顶部：房间号、学习目标与操作栏 -->
         <header class="study-topbar">
           <div class="goal-box">
@@ -286,7 +477,9 @@ onBeforeUnmount(() => {
           <div class="topbar-actions">
             <span class="scene-name">{{ sceneTitle }}</span>
             <button type="button" class="top-btn top-btn--ghost" @click="backToPlaza">暂时返回广场</button>
-            <button type="button" class="top-btn top-btn--primary" @click="finishSession">结束本局并结算</button>
+            <button type="button" class="top-btn top-btn--primary" :disabled="finishing" @click="finishSession">
+              {{ finishing ? '结算中…' : '结束本局并结算' }}
+            </button>
           </div>
         </header>
 
@@ -310,11 +503,15 @@ onBeforeUnmount(() => {
                 class="cam-btn"
                 :disabled="!consentChecked || cameraOn"
                 @click="enableCamera"
-              >{{ cameraOn ? '摄像头推流中' : '开启摄像头' }}</button>
+              >{{ cameraOn ? '摄像头已开启' : '开启摄像头' }}</button>
               <button type="button" class="cam-btn cam-btn--ghost" :disabled="!cameraOn" @click="stopCamera">
                 关闭摄像头
               </button>
             </div>
+            <!-- 发布态明确区分“本地就绪”与“后端已确认”：不用定时器伪造成功 -->
+            <p class="cam-publish-state" :class="{ 'cam-publish-state--ok': isStreamPublished }">
+              推流状态：{{ publishStateText }}
+            </p>
             <p v-if="cameraError" class="cam-error">{{ cameraError }}</p>
             <p v-if="finishError" class="cam-error">{{ finishError }}</p>
             <p class="cam-status">剩余机会 {{ roomStore.strikesLeft }} · 专注评分 {{ roomStore.focusScore ?? '--' }} · 在线督学 {{ roomStore.watcherCount }}</p>
@@ -325,8 +522,7 @@ onBeforeUnmount(() => {
           </section>
         </div>
 
-        <!-- HUD 覆盖层与惩罚弹窗 -->
-        <HudOverlay />
+        <!-- 惩罚弹窗 -->
         <PunishmentModal />
       </div>
     </SceneRenderer>
@@ -382,7 +578,11 @@ onBeforeUnmount(() => {
   position: relative;
   box-sizing: border-box;
   height: 100%;
-  padding: 64px 24px 84px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 顶部不再为绝对定位 HUD 预留固定 64px：状态条按内容自然占位 */
+  padding: 8px 24px 84px;
   color: var(--scene-primary, #00e5ff);
 }
 .study-topbar {
@@ -432,7 +632,7 @@ onBeforeUnmount(() => {
 }
 .copy-tip { font-size: 11px; color: #6ee7a8; }
 .goal-label { opacity: 0.7; font-size: 12px; white-space: nowrap; }
-.goal-text { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.goal-text { font-weight: 600; min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 .topbar-actions { display: flex; align-items: center; gap: 10px; }
 .scene-name { font-size: 13px; opacity: 0.8; }
 .top-btn {
@@ -458,9 +658,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(300px, 380px) minmax(320px, 1fr);
   gap: 20px;
-  height: 100%;
+  flex: 1 1 auto;
   min-height: 0;
-  margin-top: 16px;
 }
 @media (max-width: 860px) {
   .study-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; overflow-y: auto; }
@@ -518,6 +717,8 @@ onBeforeUnmount(() => {
   background: transparent;
 }
 .cam-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.cam-publish-state { margin: 10px 0 0; font-size: 12px; color: var(--scene-text-dim, #9aa4b2); }
+.cam-publish-state--ok { color: #4ade80; }
 .cam-error { margin: 10px 0 0; color: var(--scene-alert, #ff2a55); font-size: 12px; }
 .cam-status { margin: 12px 0 0; font-size: 12px; opacity: 0.75; }
 .chat-wrap { min-height: 0; }
