@@ -206,6 +206,8 @@ export interface WsFrameMsg {
   type: 'frame'
   image: string
   scene?: string
+  /** 单调递增帧序号，随 frame_ack 原样回传，用于精确确认“哪一帧被后端接收” */
+  frame_id?: number
 }
 
 /** 客户端上行：向指挥官求助 / 互动 */
@@ -222,21 +224,24 @@ export interface WsPunishmentSubmitMsg {
   content: string
 }
 
-/** 客户端上行：督学官弹幕 */
+/** 客户端上行：督学官/房主弹幕（message_id 由客户端生成，服务端原样回传用于幂等去重） */
 export interface WsBarrageMsg {
   type: 'barrage'
   text: string
+  message_id?: string
 }
 
-/** 客户端上行：督学官音效 */
+/** 客户端上行：督学官/房主音效（message_id 语义同弹幕） */
 export interface WsSoundEffectMsg {
   type: 'sound_effect'
   sound: SoundEffect
+  message_id?: string
 }
 
-/** 客户端上行：正常结束本局 */
+/** 客户端上行：正常结束本局（request_id 为可选去重标识，原样随 ACK 回传） */
 export interface WsFinishSessionMsg {
   type: 'finish_session'
+  request_id?: string
 }
 
 /** 客户端上行：应用层心跳保活（后端对未知 type 静默忽略，仅用于维持连接活跃） */
@@ -268,6 +273,8 @@ export interface WsAnalysisUpdateMsg {
   annotated_image?: string | null
   strikes_left?: number
   distracted_streak_sec?: number
+  /** 惩罚引擎连续走神阈值（秒），由后端权威下发，供进度条按比例渲染 */
+  strike_seconds?: number
   skipped?: boolean
 }
 
@@ -322,13 +329,15 @@ export interface WsSentinelAlertMsg {
   distracted_streak_sec: number
 }
 
-/** 服务端下行：房间互动广播（弹幕 / 音效） */
+/** 服务端下行：房间互动广播（弹幕 / 音效）。message_id 为唯一标识，供客户端幂等去重；user_id 为服务端认证身份。 */
 export interface WsRoomInteractionMsg {
   type: 'room_interaction'
   kind: 'barrage' | 'sound_effect'
   from: string
   text?: string
   sound?: string
+  message_id?: string
+  user_id?: number
 }
 
 /** 服务端下行：督学官名单更新（推房主） */
@@ -353,6 +362,34 @@ export interface WsSessionFinishedMsg {
   rank_title: string
   streak_clean_sessions: number
   shield_count: number
+}
+
+/** 结算回执状态（与后端 SETTLE_* 常量一致） */
+export type FinishAckStatus =
+  | 'success'        // 本次真正完成结算
+  | 'duplicate'      // 已完成，重复请求命中幂等缓存（携带原战报）
+  | 'in_progress'    // 并发：其它请求正在结算
+  | 'db_failed'      // 数据库保存失败（事务已回滚，可重试）
+  | 'forbidden'      // 无权：仅房主可结束
+  | 'not_found'      // 房间不存在或已结束
+  | 'internal_error' // 后端内部异常
+
+/** 服务端下行：结算回执 ACK（新客户端据此给出明确成功/失败反馈）
+ *  旧客户端不认识该 type，事件总线无订阅者即忽略，保持兼容。*/
+export interface WsSessionFinishAckMsg {
+  type: 'session_finish_ack'
+  status: FinishAckStatus
+  message: string
+  request_id?: string
+  room_id: string
+  result?: {
+    duration_minutes: number
+    avg_score: number | null
+    total_focus_minutes: number
+    rank_title: string
+    streak_clean_sessions: number
+    shield_count: number
+  }
 }
 
 /** 服务端下行：房主离开导致房间关闭（保留类型兼容，暂离改用 host_status） */
@@ -386,6 +423,50 @@ export interface WsRoomStateSyncMsg {
   dialogue_history: DialogueHistoryItem[]
 }
 
+/** 服务端下行：帧回执。仅当后端确认写入有效画面时 ok=true，区分“WS 发送成功”与“后端处理成功”。
+ *  旧客户端不认识该 type，事件总线无订阅者即忽略，保持兼容。*/
+export interface WsFrameAckMsg {
+  type: 'frame_ack'
+  ok: boolean
+  /** 对应上行 frame 的 frame_id（后端原样回传，未带则为 undefined） */
+  frame_id?: number
+  /** ok=true 时的画面到达时间戳 */
+  ts?: number
+  /** ok=false 的原因：empty_frame / stale_room */
+  reason?: string
+  /** 该帧画面已写入，但推理因背压跳过（不影响发布成功判定） */
+  analysis_skipped?: boolean
+}
+
+/** 服务端下行：当前推流发布态（房主连入/重连时单发，供刷新后以服务端现场校准） */
+export interface WsStreamStatusMsg {
+  type: 'stream_status'
+  /** 后端当前是否持有有效画面（last_frame_b64 非空） */
+  published: boolean
+  /** 画面到达时间戳，未发布时为 null */
+  ts?: number | null
+}
+
+/**
+ * 视频状态机（房主发布侧）。
+ * 严格区分“本地摄像头就绪”与“远端已确认接收”：GET_USER_MEDIA 成功只到 CAMERA_READY，
+ * 只有后端 frame_ack(ok=true) 才能进入 STREAM_PUBLISHED，绝不由定时器伪造成功。
+ */
+export type PublishStreamState =
+  | 'CAMERA_CLOSED'     // 未开启摄像头
+  | 'CAMERA_OPENING'    // getUserMedia 授权中
+  | 'CAMERA_READY'      // 本地视频轨就绪，尚未获得后端确认
+  | 'PUBLISHING'        // 已发出帧，等待后端 frame_ack
+  | 'STREAM_PUBLISHED'  // 后端已确认收到有效画面
+  | 'STREAM_ERROR'      // 连续发送失败 / 后端回执失败
+
+/** 视频状态机（观看端接收侧），依据受鉴权快照 HTTP 结果与画面时间戳判定 */
+export type ReceiveStreamState =
+  | 'REMOTE_UNPUBLISHED' // 后端尚无画面（快照 404）
+  | 'REMOTE_RECEIVING'   // 已收到有效图片且浏览器成功渲染
+  | 'REMOTE_STALE'       // 曾收到画面但长时间未更新（房主停推）
+  | 'REMOTE_ERROR'       // 网络/权限异常，未能获取快照
+
 /** 服务端下行消息联合类型 */
 export type WsIncomingMsg =
   | WsAnalysisUpdateMsg
@@ -401,9 +482,12 @@ export type WsIncomingMsg =
   | WsWatcherUpdateMsg
   | WsRoomLockedMsg
   | WsSessionFinishedMsg
+  | WsSessionFinishAckMsg
   | WsRoomClosedMsg
   | WsHostStatusMsg
   | WsRoomStateSyncMsg
+  | WsFrameAckMsg
+  | WsStreamStatusMsg
 
 /** 服务端下行消息的 type 字段联合，供事件总线键类型约束 */
 export type WsIncomingType = WsIncomingMsg['type']

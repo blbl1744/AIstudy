@@ -30,6 +30,12 @@ export interface RoomInteraction {
   from: string
   text?: string
   sound?: string
+  /** 服务端/客户端生成的唯一标识，供幂等去重；旧消息可能缺省 */
+  message_id?: string
+  /** 服务端认证身份，不依赖可重名的昵称 */
+  user_id?: number
+  /** 单调递增序号，供晚挂载组件按序补放 */
+  seq: number
 }
 
 export const useRoomStore = defineStore('room', () => {
@@ -41,6 +47,9 @@ export const useRoomStore = defineStore('room', () => {
   const strikesLeft = ref(3)
   const focusScore = ref<number | null>(null)
   const distractedStreakSec = ref(0)
+  // 连续走神阈值（秒）由后端惩罚引擎权威下发；默认值仅用于首帧到达前占位，
+  // 不参与任何业务裁决（是否走神/是否扣血完全由后端决定）。
+  const strikeSeconds = ref(10)
   const isLocked = ref(false)
   const activePunishment = ref('')
   const watcherCount = ref(0)
@@ -55,6 +64,70 @@ export const useRoomStore = defineStore('room', () => {
   const socket = shallowRef<RoomSocket | null>(null)
 
   let dialogueSeq = 0
+
+  // ===== 弹幕可靠去重（第五阶段⑦）=====
+  // 单一权威数据流：所有 room_interaction 先在此按 message_id 幂等去重并写入有界缓存，
+  // HudOverlay 只从缓存按游标消费，从而避免“直接订阅 socket 受挂载/重连时序影响丢消息”。
+  const INTERACTION_CACHE_MAX = 128
+  const interactionCache = ref<RoomInteraction[]>([])
+  let interactionSeq = 0
+  let hudCursorSeq = 0
+  /** HUD 监听用的单调水位：每次新增互动自增，避免缓存满后 length 不变漏触发 */
+  const interactionHeadSeq = ref(0)
+  const seenInteractionIds = new Set<string>()
+  const seenIdOrder: string[] = []
+
+  /** 记忆 message_id 并判断是否首次见到；无 id 的旧消息用自动 id 兜底，缓存有界 FIFO 淘汰。 */
+  function rememberInteraction(id: string): boolean {
+    if (seenInteractionIds.has(id)) return false
+    seenInteractionIds.add(id)
+    seenIdOrder.push(id)
+    if (seenIdOrder.length > INTERACTION_CACHE_MAX) {
+      const evicted = seenIdOrder.shift()
+      if (evicted !== undefined) seenInteractionIds.delete(evicted)
+    }
+    return true
+  }
+
+  /** 处理一条服务端互动广播：去重后写入缓存；返回是否新增。 */
+  function noteInteraction(msg: {
+    kind: 'barrage' | 'sound_effect'
+    from: string
+    text?: string
+    sound?: string
+    message_id?: string
+    user_id?: number
+  }): boolean {
+    const id = (msg.message_id && msg.message_id.trim())
+      ? msg.message_id.trim()
+      : `auto:${++interactionSeq}`
+    const item: RoomInteraction = {
+      kind: msg.kind,
+      from: msg.from,
+      text: msg.text,
+      sound: msg.sound,
+      message_id: id,
+      user_id: msg.user_id,
+      seq: ++interactionSeq,
+    }
+    lastInteraction.value = item
+    if (!rememberInteraction(id)) return false
+    interactionCache.value.push(item)
+    if (interactionCache.value.length > INTERACTION_CACHE_MAX) {
+      interactionCache.value.shift()
+    }
+    interactionHeadSeq.value = item.seq
+    return true
+  }
+
+  /** HUD 按游标取走尚未展示的互动，推进游标；晚挂载与重连均不重复、不丢。 */
+  function drainHudInteractions(): RoomInteraction[] {
+    const pending = interactionCache.value.filter((item) => item.seq > hudCursorSeq)
+    if (pending.length > 0) {
+      hudCursorSeq = pending[pending.length - 1].seq
+    }
+    return pending
+  }
 
   // ===== 派生 =====
   const strikesUsed = computed(() => Math.max(0, 3 - strikesLeft.value))
@@ -139,6 +212,10 @@ export const useRoomStore = defineStore('room', () => {
       if (typeof msg.distracted_streak_sec === 'number') {
         distractedStreakSec.value = msg.distracted_streak_sec
       }
+      // 阈值以服务端实际惩罚阈值为准，前端不硬编码、不自行推算业务状态
+      if (typeof msg.strike_seconds === 'number' && msg.strike_seconds > 0) {
+        strikeSeconds.value = msg.strike_seconds
+      }
     })
 
     ws.on('ai_dialogue_start', (msg) => {
@@ -178,12 +255,16 @@ export const useRoomStore = defineStore('room', () => {
     })
 
     ws.on('room_interaction', (msg) => {
-      lastInteraction.value = {
+      // 单一权威入口：按 message_id 幂等去重后写入缓存，供 HUD 按游标消费；
+      // 房主/学员/跨房均由后端广播与房间隔离约束，前端只负责可靠渲染。
+      noteInteraction({
         kind: msg.kind,
         from: msg.from,
         text: msg.text,
         sound: msg.sound,
-      }
+        message_id: msg.message_id,
+        user_id: msg.user_id,
+      })
     })
 
     ws.on('watcher_update', (msg) => {
@@ -253,6 +334,7 @@ export const useRoomStore = defineStore('room', () => {
     strikesLeft.value = 3
     focusScore.value = null
     distractedStreakSec.value = 0
+    strikeSeconds.value = 10
     isLocked.value = false
     activePunishment.value = ''
     watcherCount.value = 0
@@ -263,6 +345,13 @@ export const useRoomStore = defineStore('room', () => {
     sentinelMessage.value = ''
     interactionSoundOn.value = true
     dialogueSeq = 0
+    // 清空弹幕去重态：换房/重连后不与旧房间的消息 ID 冲突，缓存与游标归零
+    interactionCache.value = []
+    interactionSeq = 0
+    hudCursorSeq = 0
+    interactionHeadSeq.value = 0
+    seenInteractionIds.clear()
+    seenIdOrder.length = 0
   }
 
   return {
@@ -272,6 +361,7 @@ export const useRoomStore = defineStore('room', () => {
     strikesLeft,
     focusScore,
     distractedStreakSec,
+    strikeSeconds,
     isLocked,
     activePunishment,
     watcherCount,
@@ -279,6 +369,8 @@ export const useRoomStore = defineStore('room', () => {
     dialogueLines,
     dialogueActive,
     lastInteraction,
+    interactionCache,
+    interactionHeadSeq,
     sentinelMessage,
     interactionSoundOn,
     socket,
@@ -291,6 +383,7 @@ export const useRoomStore = defineStore('room', () => {
     applyDialogueHistory,
     createSocket,
     send,
+    drainHudInteractions,
     isSocketConnected,
     submitPunishmentHttp,
     reset,
